@@ -14,6 +14,7 @@ import {
   traverseHistory,
 } from "@/app/navigation/navigationGuard";
 import type { SearchHit } from "@/shared/api/types";
+import { beginChannelSwitchTrace } from "@/shared/lib/channelSwitchPerf";
 
 type NavigationBehavior = {
   force?: boolean;
@@ -284,6 +285,16 @@ export function useAppNavigation() {
         threadRootId?: string | null;
       },
     ) => {
+      // Every channel navigation entry point funnels through here, so this
+      // is the single click-time anchor for the switch trace. Re-selecting
+      // the already-active channel is a no-op navigation: the channel's
+      // effects never rerun, nothing would settle the trace, and it would
+      // squat on the singleton until timeout — so don't open one. (History
+      // back/forward bypasses goChannel entirely and is deliberately
+      // untraced.)
+      if (!location.pathname.endsWith(`/channels/${channelId}`)) {
+        beginChannelSwitchTrace(channelId);
+      }
       return commitNavigation(
         {
           to: "/channels/$channelId",
@@ -325,7 +336,7 @@ export function useAppNavigation() {
           : undefined,
       );
     },
-    [commitNavigation],
+    [commitNavigation, location.pathname],
   );
 
   const goNewMessage = React.useCallback(
