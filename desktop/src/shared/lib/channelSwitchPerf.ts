@@ -158,6 +158,37 @@ export function abandonChannelSwitchTrace(channelId: string): void {
   }
 }
 
+// Route-exit abandons currently deferred; see scheduleRouteExitAbandon.
+const pendingRouteExitAbandons = new Set<string>();
+
+/**
+ * scheduleRouteExitAbandon abandons the channel's trace one microtask from
+ * now unless cancelRouteExitAbandon runs first. Call it from the route-exit
+ * effect cleanup: deferring lets React StrictMode's dev-only effect replay
+ * — cleanup + re-setup, synchronously within one commit — cancel the
+ * abandon, where abandoning synchronously would kill every just-opened
+ * trace in dev builds and break the Performance-panel workflow. A real
+ * route exit has no re-setup, so the scheduled abandon still fires — and
+ * microtasks run before any frame callback, so a queued settle cannot
+ * record in the gap.
+ */
+export function scheduleRouteExitAbandon(channelId: string): void {
+  pendingRouteExitAbandons.add(channelId);
+  queueMicrotask(() => {
+    if (pendingRouteExitAbandons.delete(channelId)) {
+      abandonChannelSwitchTrace(channelId);
+    }
+  });
+}
+
+/**
+ * cancelRouteExitAbandon revokes a pending scheduleRouteExitAbandon for the
+ * channel. Call it from the route-enter effect setup, before any work.
+ */
+export function cancelRouteExitAbandon(channelId: string): void {
+  pendingRouteExitAbandons.delete(channelId);
+}
+
 export function beginChannelSwitchTrace(channelId: string): void {
   if (typeof performance === "undefined") return;
   activeTrace = {
@@ -221,6 +252,7 @@ export function traceChannelMembersFetch(
  */
 export function resetChannelSwitchTrace(): void {
   activeTrace = null;
+  pendingRouteExitAbandons.clear();
 }
 
 /** Bound on waiting for the deferred timeline commit before recording. */
@@ -229,9 +261,11 @@ const SETTLE_RENDER_WAIT_MS = 5_000;
 /**
  * Closes the active trace once the settled frame has painted. The timeline
  * renders rows through a deferred snapshot that exposes
- * `data-render-pending` until the low-priority commit catches up — waiting
- * for it (bounded) keeps `totalMs` honest on render-heavy switches; a final
- * rAF pair then lands the mark after the browser paints.
+ * `data-render-pending` until the low-priority commit catches up, and the
+ * lazy channel pane's Suspense fallback carries the same marker while its
+ * chunk is still loading — waiting for both (bounded) keeps `totalMs`
+ * honest on render-heavy and cold-chunk switches; a final rAF pair then
+ * lands the mark after the browser paints.
  */
 export function settleChannelSwitchTrace(channelId: string): void {
   if (typeof performance === "undefined") return;

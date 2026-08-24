@@ -130,6 +130,8 @@ async function withSettleHarness(run) {
   const {
     abandonChannelSwitchTrace,
     beginChannelSwitchTrace,
+    cancelRouteExitAbandon,
+    scheduleRouteExitAbandon,
     settleChannelSwitchTrace,
     resetChannelSwitchTrace,
     CHANNEL_SWITCH_MEASURE,
@@ -149,6 +151,8 @@ async function withSettleHarness(run) {
     await run({
       abandon: abandonChannelSwitchTrace,
       begin: beginChannelSwitchTrace,
+      cancelAbandon: cancelRouteExitAbandon,
+      scheduleAbandon: scheduleRouteExitAbandon,
       settle: settleChannelSwitchTrace,
       reset: resetChannelSwitchTrace,
       flush,
@@ -196,6 +200,42 @@ test("an undisturbed settle records exactly one measure", async () => {
     flush();
     assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
   });
+});
+
+test("a scheduled route-exit abandon canceled in the same task keeps the trace", async () => {
+  await withSettleHarness(
+    async ({
+      begin,
+      cancelAbandon,
+      scheduleAbandon,
+      settle,
+      flush,
+      measures,
+    }) => {
+      begin("aaaa1111aaaa1111");
+      // StrictMode's dev-only effect replay: cleanup schedules the abandon,
+      // the synchronous re-setup cancels it before the microtask runs.
+      scheduleAbandon("aaaa1111aaaa1111");
+      cancelAbandon("aaaa1111aaaa1111");
+      await Promise.resolve();
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
+    },
+  );
+});
+
+test("an uncanceled route-exit abandon drops the trace before any frame fires", async () => {
+  await withSettleHarness(
+    async ({ begin, scheduleAbandon, settle, flush, measures }) => {
+      begin("aaaa1111aaaa1111");
+      scheduleAbandon("aaaa1111aaaa1111");
+      await Promise.resolve();
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), []);
+    },
+  );
 });
 
 test("leaving the channel surface abandons the trace; history-back records nothing", async () => {

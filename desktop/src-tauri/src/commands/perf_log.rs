@@ -14,8 +14,28 @@ use tauri::Manager;
 const PERF_LOG_FILENAME: &str = "switch-perf.jsonl";
 
 /// Defensive cap: one record is a small trace object; anything larger is a
-/// caller bug and must not grow the log unbounded.
+/// caller bug and must not grow the log unbounded. Enforced on the input
+/// record and again on the final serialized line, so folded-in metadata can
+/// never defeat it.
 const MAX_RECORD_BYTES: usize = 4 * 1024;
+
+/// Upper bound on the operator-supplied `BUZZ_PERF_LOG_LABEL` run label.
+/// Truncating (rather than erroring) keeps a fat-fingered label from
+/// silently dropping every trace for the whole run — the frontend swallows
+/// sink errors by design.
+const MAX_LABEL_BYTES: usize = 128;
+
+/// Truncates to the last char boundary at or below `max_bytes`.
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
 
 /// Rotation threshold. The sink is always on, so without a cap the JSONL
 /// grows for the life of the install; one rotated generation preserves
@@ -48,10 +68,18 @@ fn shape_perf_log_line(
     if let Some(label) = label {
         object.insert(
             "label".to_string(),
-            serde_json::Value::String(label.to_string()),
+            serde_json::Value::String(
+                truncate_at_char_boundary(label, MAX_LABEL_BYTES).to_string(),
+            ),
         );
     }
-    serde_json::to_string(&value).map_err(|e| e.to_string())
+    let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    // The cap must hold for what actually reaches the disk: gitSha and label
+    // are folded in after the record-size check above.
+    if line.len() > MAX_RECORD_BYTES {
+        return Err("perf log line too large".to_string());
+    }
+    Ok(line)
 }
 
 /// Serializes the whole metadata→rename→append transaction. Appends run on
@@ -149,6 +177,44 @@ mod tests {
         assert!(shape_perf_log_line("not json", None, None).is_err());
         let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RECORD_BYTES));
         assert!(shape_perf_log_line(&oversized, None, None).is_err());
+    }
+
+    #[test]
+    fn shape_truncates_an_unbounded_label_and_keeps_the_line_capped() {
+        // BUZZ_PERF_LOG_LABEL is operator-supplied; a runaway value must not
+        // defeat the record cap by being folded in after the size check.
+        let label = "l".repeat(1024 * 1024);
+        let line =
+            shape_perf_log_line(r#"{"totalMs":13}"#, Some("abc123"), Some(&label)).expect("shape");
+        assert!(line.len() <= MAX_RECORD_BYTES, "line stays under the cap");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("parse");
+        assert_eq!(
+            value["label"].as_str().expect("label").len(),
+            MAX_LABEL_BYTES
+        );
+        assert_eq!(value["totalMs"], 13);
+    }
+
+    #[test]
+    fn label_truncation_cuts_at_a_char_boundary() {
+        // '€' is 3 bytes; MAX_LABEL_BYTES (128) is not a multiple of 3, so a
+        // byte-index cut would split a char and panic (or emit invalid UTF-8).
+        let label = "€".repeat(MAX_LABEL_BYTES);
+        let line = shape_perf_log_line(r#"{"totalMs":1}"#, None, Some(&label)).expect("shape");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("parse");
+        let stored = value["label"].as_str().expect("label");
+        assert_eq!(stored.len(), MAX_LABEL_BYTES - (MAX_LABEL_BYTES % 3));
+        assert!(stored.chars().all(|c| c == '€'));
+    }
+
+    #[test]
+    fn shape_rejects_a_line_that_outgrows_the_cap_after_metadata() {
+        // The record alone passes the input check; the folded-in git sha
+        // pushes the serialized line over the cap.
+        let pad = "x".repeat(MAX_RECORD_BYTES - 20);
+        let record = format!(r#"{{"pad":"{pad}"}}"#);
+        assert!(record.len() <= MAX_RECORD_BYTES);
+        assert!(shape_perf_log_line(&record, Some(&"s".repeat(64)), None).is_err());
     }
 
     #[test]

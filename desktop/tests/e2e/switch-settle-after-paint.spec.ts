@@ -56,3 +56,72 @@ test("cold-switch settle measure lands only after rows are painted", async ({
     "settle must not be recorded while a deferred commit is still pending",
   ).toBe(false);
 });
+
+/**
+ * While the lazy ChannelPane chunk is still suspended, the timeline (and its
+ * render-pending marker) is not mounted — only the Suspense fallback is. The
+ * fallback must therefore read as pending itself, or the tracer would record
+ * a settle with zero rows while the loading skeleton was still visible. This
+ * spec holds the chunk to pin that contract.
+ */
+test("settle waits for a delayed lazy channel-pane chunk", async ({ page }) => {
+  let releaseChunk = () => {};
+  const chunkHold = new Promise<void>((resolve) => {
+    releaseChunk = resolve;
+  });
+  let chunkRequested = false;
+  await page.route(/\/assets\/ChannelPane-[^/]+\.js(\?.*)?$/, async (route) => {
+    chunkRequested = true;
+    await chunkHold;
+    await route.continue();
+  });
+
+  await installMockBridge(page, { deepHistoryMessageCount: 600 });
+  await page.goto("/");
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+
+  await page.getByTestId("channel-deep-history").click();
+  await expect
+    .poll(() => chunkRequested, {
+      message: "the ChannelPane chunk must load lazily on first channel entry",
+    })
+    .toBe(true);
+
+  // Give the tracer ample frames to (incorrectly) settle behind the held
+  // chunk. This wait must stay well under the tracer's 5s settle deadline.
+  await page.waitForTimeout(1_500);
+  const early = await page.evaluate(
+    (name) => performance.getEntriesByName(name).length,
+    SWITCH_MEASURE,
+  );
+  expect(
+    early,
+    "no settle may be recorded while the pane chunk is suspended",
+  ).toBe(0);
+
+  releaseChunk();
+
+  // Same in-page polling as above: snapshot the DOM in the evaluation turn
+  // where the measure first exists.
+  const atSettle = await page.evaluate(async (measureName) => {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      if (performance.getEntriesByName(measureName).length > 0) {
+        return {
+          rowCount: document.querySelectorAll(
+            '[data-message-id^="mock-deep-history-"]',
+          ).length,
+          settled: true,
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 16));
+    }
+    return { rowCount: 0, settled: false };
+  }, SWITCH_MEASURE);
+
+  expect(atSettle.settled, "switch trace must settle after release").toBe(true);
+  expect(
+    atSettle.rowCount,
+    "the settle must land only after the released pane painted rows",
+  ).toBeGreaterThan(0);
+});
