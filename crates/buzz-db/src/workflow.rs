@@ -1738,6 +1738,16 @@ pub async fn claim_workflow_agent_delivery(
             "delivery lease_seconds must be positive".into(),
         ));
     }
+    // The expected binding is an authority claim about which row may be
+    // consumed; the (community, target) request scope is where the row is
+    // looked up. If they disagree, a foreign binding could authorize a row
+    // selected under a different scope, so reject the mismatch before SQL
+    // rather than letting the scope arguments silently override the binding.
+    if let Some(expected) = expected {
+        if expected.community_id() != community_id || expected.target_pubkey() != *target_pubkey {
+            return Ok(None);
+        }
+    }
     let target_bytes = target_pubkey.to_bytes().to_vec();
     // Decompose the expected cause so a mismatch on any cause identity — not
     // only the shared columns — makes the claim a miss.
@@ -1813,11 +1823,14 @@ pub async fn claim_workflow_agent_delivery(
     Ok(Some((lease, record)))
 }
 
-/// Extend a live lease, fenced by the caller's generation.
+/// Extend a live lease, fenced by the caller's generation and target.
 ///
 /// Advances `lease_until` only for a still-claimed row whose current generation
-/// matches the lease token. A reaped, superseded, or already-terminal holder
-/// matches zero rows and receives [`WorkflowDeliveryRenewOutcome::LeaseLost`].
+/// matches the lease token, whose target matches the lease's held recipient,
+/// and whose lease has not yet expired on the DB clock. A reaped, superseded,
+/// already-terminal, expired, or wrong-target holder matches zero rows and
+/// receives [`WorkflowDeliveryRenewOutcome::LeaseLost`]; a lease that has
+/// passed its deadline cannot resurrect itself before the reaper runs.
 pub async fn renew_workflow_agent_delivery(
     pool: &PgPool,
     lease: &WorkflowDeliveryLease,
@@ -1831,17 +1844,20 @@ pub async fn renew_workflow_agent_delivery(
     let row = sqlx::query(
         r#"
         UPDATE workflow_agent_deliveries
-        SET lease_until = NOW() + make_interval(secs => $4)
+        SET lease_until = NOW() + make_interval(secs => $5)
         WHERE community_id = $1
           AND id = $2
+          AND target_pubkey = $4
           AND status = 'claimed'
           AND lease_generation = $3
+          AND lease_until >= NOW()
         RETURNING lease_until
         "#,
     )
     .bind(lease.community_id.as_uuid())
     .bind(lease.delivery_id.as_uuid())
     .bind(lease.lease_generation)
+    .bind(lease.target_pubkey.to_bytes().to_vec())
     .bind(lease_seconds as f64)
     .fetch_optional(pool)
     .await?;
@@ -1857,12 +1873,14 @@ pub async fn renew_workflow_agent_delivery(
 /// Perform the once-only terminal transition, fenced by the caller's lease, and
 /// reconcile uncertain completion.
 ///
-/// If the caller's generation still holds a claimed row, it is settled to the
-/// requested terminal outcome exactly once. If the row is already terminal, the
-/// recorded terminal status is returned so a retry after a crash between the
-/// agent's work and the durable finish converges idempotently to the same
-/// terminal rather than reopening the delivery. Any other state (reaped,
-/// superseded, or a lost race) fails closed with
+/// If the caller's full capability (target + generation) still holds a claimed,
+/// unexpired row, it is settled to the requested terminal outcome exactly once.
+/// If the row is already terminal under the caller's own target and generation,
+/// status is returned so a retry after a crash between the agent's work and the
+/// durable finish converges idempotently to the same terminal rather than
+/// reopening the delivery. Any other state — reaped, superseded, expired, a
+/// lost race, a wrong-target lease, or a terminal written by a newer holder at
+/// a different generation — fails closed with
 /// [`WorkflowDeliveryFinishOutcome::LeaseLost`].
 pub async fn finish_workflow_agent_delivery(
     pool: &PgPool,
@@ -1883,8 +1901,10 @@ pub async fn finish_workflow_agent_delivery(
             finished_at = NOW()
         WHERE community_id = $1
           AND id = $2
+          AND target_pubkey = $5
           AND status = 'claimed'
           AND lease_generation = $3
+          AND lease_until >= NOW()
         RETURNING status::text AS status
         "#,
     )
@@ -1892,6 +1912,7 @@ pub async fn finish_workflow_agent_delivery(
     .bind(lease.delivery_id.as_uuid())
     .bind(lease.lease_generation)
     .bind(outcome.as_status())
+    .bind(lease.target_pubkey.to_bytes().to_vec())
     .fetch_optional(&mut *transaction)
     .await?;
 
@@ -1900,15 +1921,24 @@ pub async fn finish_workflow_agent_delivery(
         return Ok(WorkflowDeliveryFinishOutcome::Settled(outcome));
     }
 
-    // No transition happened. Distinguish "already terminal" (idempotent
-    // convergence) from "lease lost" (fail closed) by reading current state
-    // inside the same transaction.
+    // No transition happened. Distinguish "already terminal under THIS lease"
+    // (idempotent convergence for an uncertain-completion retry) from "lease
+    // lost" (fail closed) by reading current state inside the same transaction.
+    // The terminal read is fenced by the caller's FULL lease capability
+    // (target + generation): finish never bumps the generation, so a genuine
+    // retry by the true holder still matches, but a terminal written by a NEWER
+    // holder (after this lease was reaped and re-claimed at a higher
+    // generation) or a lease reconstituted with the wrong target must not be
+    // laundered back as its own success. Any target or generation mismatch is
+    // therefore LeaseLost.
     let current = sqlx::query(
         "SELECT status::text AS status FROM workflow_agent_deliveries \
-         WHERE community_id = $1 AND id = $2",
+         WHERE community_id = $1 AND id = $2 AND target_pubkey = $4 AND lease_generation = $3",
     )
     .bind(lease.community_id.as_uuid())
     .bind(lease.delivery_id.as_uuid())
+    .bind(lease.lease_generation)
+    .bind(lease.target_pubkey.to_bytes().to_vec())
     .fetch_optional(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -3916,6 +3946,323 @@ mod tests {
         assert!(
             direct.is_err(),
             "write fence must block a fenced-tenant mutation"
+        );
+    }
+
+    /// A terminal written by a NEWER holder must not be laundered back to a
+    /// stale prior holder as its own successful reconciliation. Reproduce the
+    /// exact interleaving Larry flagged: gen-1 claims and expires, the reaper
+    /// bumps to a fresh generation, gen-2 claims and finishes, then gen-1 calls
+    /// `finish`. The gen-1 UPDATE correctly misses, and the generation-fenced
+    /// terminal read must return `LeaseLost` rather than `AlreadyTerminal`.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_holder_finish_after_newer_holder_settles_fails_closed() {
+        // Exercise both the same-outcome and conflicting-outcome interleavings:
+        // neither may attribute the newer holder's terminal to the stale one.
+        for (gen2_outcome, gen1_retry) in [
+            (
+                WorkflowDeliveryOutcome::Finished,
+                WorkflowDeliveryOutcome::Finished,
+            ),
+            (
+                WorkflowDeliveryOutcome::Finished,
+                WorkflowDeliveryOutcome::Failed,
+            ),
+        ] {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let target = Keys::generate().public_key();
+            let (delivery, created_at) = make_delivery_scaffold(&pool, community, &target).await;
+            commit_one(&pool, community, &delivery, created_at).await;
+
+            // gen-1 claims, then its lease is expired and reaped.
+            let (gen1, _) = claim_workflow_agent_delivery(
+                &pool,
+                community,
+                &target,
+                Some(delivery.id),
+                None,
+                1,
+            )
+            .await
+            .expect("claim")
+            .expect("claimable");
+            sqlx::query(
+                "UPDATE workflow_agent_deliveries SET lease_until = NOW() - INTERVAL '1 minute' \
+                 WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(delivery.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("force expiry");
+            assert_eq!(
+                reap_expired_workflow_agent_deliveries(&pool)
+                    .await
+                    .expect("reap"),
+                1
+            );
+
+            // gen-2 claims the reaped row (higher generation) and finishes it.
+            let (gen2, _) = claim_workflow_agent_delivery(
+                &pool,
+                community,
+                &target,
+                Some(delivery.id),
+                None,
+                30,
+            )
+            .await
+            .expect("claim")
+            .expect("re-claimable");
+            assert!(gen2.lease_generation > gen1.lease_generation, "reap bumped");
+            assert_eq!(
+                finish_workflow_agent_delivery(&pool, &gen2, gen2_outcome)
+                    .await
+                    .expect("gen2 finish"),
+                WorkflowDeliveryFinishOutcome::Settled(gen2_outcome)
+            );
+
+            // gen-1's finish must fail closed, NOT converge to gen-2's terminal.
+            assert_eq!(
+                finish_workflow_agent_delivery(&pool, &gen1, gen1_retry)
+                    .await
+                    .expect("gen1 finish"),
+                WorkflowDeliveryFinishOutcome::LeaseLost,
+                "a stale holder must not be credited with a newer holder's terminal"
+            );
+        }
+    }
+
+    /// A lease cannot depend on the reaper running first to become invalid: once
+    /// the deadline passes, neither renew nor finish may resurrect authority or
+    /// settle out-of-lease work, even before the reaper wins.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn expired_lease_cannot_renew_or_finish_before_reap() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let target = Keys::generate().public_key();
+        let (delivery, created_at) = make_delivery_scaffold(&pool, community, &target).await;
+        commit_one(&pool, community, &delivery, created_at).await;
+
+        let (lease, _) =
+            claim_workflow_agent_delivery(&pool, community, &target, Some(delivery.id), None, 30)
+                .await
+                .expect("claim")
+                .expect("claimable");
+
+        // Expire the lease on the DB clock WITHOUT reaping: status is still
+        // 'claimed' and the generation is unchanged, so only the deadline gate
+        // can reject the expired holder.
+        sqlx::query(
+            "UPDATE workflow_agent_deliveries SET lease_until = NOW() - INTERVAL '1 minute' \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(delivery.id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("force expiry");
+
+        assert_eq!(
+            renew_workflow_agent_delivery(&pool, &lease, 30)
+                .await
+                .expect("renew"),
+            WorkflowDeliveryRenewOutcome::LeaseLost,
+            "an expired lease must not resurrect itself via renew"
+        );
+        assert_eq!(
+            finish_workflow_agent_delivery(&pool, &lease, WorkflowDeliveryOutcome::Finished)
+                .await
+                .expect("finish"),
+            WorkflowDeliveryFinishOutcome::LeaseLost,
+            "an expired lease must not settle out-of-lease work via finish"
+        );
+
+        // The row is untouched (still claimed at the same generation) and thus
+        // still reclaimable by the reaper — the deadline gate rejected the
+        // holder without mutating state.
+        let after = get_workflow_agent_delivery(&pool, community, delivery.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(after.status, WorkflowDeliveryStatus::Claimed);
+        assert_eq!(after.lease_generation, lease.lease_generation);
+
+        // Reap this test's own expired row before returning: it proves the row
+        // was genuinely still reclaimable, and it clears the fleet-wide reaper's
+        // view so a sibling test's fleet-wide reap count stays deterministic.
+        assert_eq!(
+            reap_expired_workflow_agent_deliveries(&pool)
+                .await
+                .expect("reap"),
+            1,
+            "the expired-but-unmutated row is reclaimed by the reaper"
+        );
+    }
+
+    /// The lease is a target-scoped capability: renew, finish, and the terminal
+    /// reconciliation SELECT must all bind the held `target_pubkey`, or a lease
+    /// reconstituted with the wrong target but the right delivery id and
+    /// generation could renew, settle, or be credited with a terminal it never
+    /// earned. The DB owner boundary makes wrong-target authority unrepresentable.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lease_is_fenced_by_target() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let target = Keys::generate().public_key();
+        let (delivery, created_at) = make_delivery_scaffold(&pool, community, &target).await;
+        commit_one(&pool, community, &delivery, created_at).await;
+
+        let (lease, _) =
+            claim_workflow_agent_delivery(&pool, community, &target, Some(delivery.id), None, 30)
+                .await
+                .expect("claim")
+                .expect("claimable");
+
+        // A lease with the correct id + generation but a foreign target must
+        // fail closed on renew and finish — the id/generation alone are not the
+        // capability.
+        let wrong_target = WorkflowDeliveryLease {
+            target_pubkey: Keys::generate().public_key(),
+            ..lease
+        };
+        assert_ne!(wrong_target.target_pubkey, lease.target_pubkey);
+        assert_eq!(
+            renew_workflow_agent_delivery(&pool, &wrong_target, 30)
+                .await
+                .expect("renew"),
+            WorkflowDeliveryRenewOutcome::LeaseLost,
+            "a wrong-target lease must not renew"
+        );
+        assert_eq!(
+            finish_workflow_agent_delivery(&pool, &wrong_target, WorkflowDeliveryOutcome::Finished)
+                .await
+                .expect("finish"),
+            WorkflowDeliveryFinishOutcome::LeaseLost,
+            "a wrong-target lease must not settle"
+        );
+
+        // The real target still holds full authority.
+        assert!(matches!(
+            renew_workflow_agent_delivery(&pool, &lease, 30)
+                .await
+                .expect("renew"),
+            WorkflowDeliveryRenewOutcome::Renewed(_)
+        ));
+        assert_eq!(
+            finish_workflow_agent_delivery(&pool, &lease, WorkflowDeliveryOutcome::Finished)
+                .await
+                .expect("finish"),
+            WorkflowDeliveryFinishOutcome::Settled(WorkflowDeliveryOutcome::Finished)
+        );
+
+        // Once the true holder has settled, a wrong-target retry must fail
+        // closed via the terminal reconciliation SELECT — it must NOT be
+        // laundered the real holder's terminal as `AlreadyTerminal`.
+        assert_eq!(
+            finish_workflow_agent_delivery(&pool, &wrong_target, WorkflowDeliveryOutcome::Finished)
+                .await
+                .expect("finish retry"),
+            WorkflowDeliveryFinishOutcome::LeaseLost,
+            "a wrong-target retry must not be credited the real holder's terminal"
+        );
+        // The true holder's own idempotent retry still converges to its terminal.
+        assert_eq!(
+            finish_workflow_agent_delivery(&pool, &lease, WorkflowDeliveryOutcome::Failed)
+                .await
+                .expect("finish retry"),
+            WorkflowDeliveryFinishOutcome::AlreadyTerminal(WorkflowDeliveryStatus::Finished)
+        );
+    }
+
+    /// The claim's expected binding is an authority claim, not a scope override:
+    /// its own community and target must equal the request scope, or a foreign
+    /// binding could authorize a row selected under a different scope.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn claim_rejects_expected_binding_scope_mismatch() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let other_community = make_community(&pool).await;
+        let target = Keys::generate().public_key();
+        let other_target = Keys::generate().public_key();
+        let (delivery, created_at) = make_delivery_scaffold(&pool, community, &target).await;
+        commit_one(&pool, community, &delivery, created_at).await;
+
+        // An expected binding whose community disagrees with the request scope
+        // must be rejected before SQL — never authorize the request-scope row.
+        let foreign_community = WorkflowDeliveryBinding::new(
+            other_community,
+            delivery.binding.workflow_id(),
+            delivery.binding.run_id(),
+            delivery.binding.step_id(),
+            target,
+            delivery.binding.definition_event_id(),
+            delivery.binding.message_event_id(),
+            delivery.binding.cause().clone(),
+        )
+        .expect("binding");
+        assert!(
+            claim_workflow_agent_delivery(
+                &pool,
+                community,
+                &target,
+                Some(delivery.id),
+                Some(&foreign_community),
+                30,
+            )
+            .await
+            .expect("claim")
+            .is_none(),
+            "an expected binding for another community must not claim this row"
+        );
+
+        // Likewise a binding whose target disagrees with the request scope.
+        let foreign_target = WorkflowDeliveryBinding::new(
+            community,
+            delivery.binding.workflow_id(),
+            delivery.binding.run_id(),
+            delivery.binding.step_id(),
+            other_target,
+            delivery.binding.definition_event_id(),
+            delivery.binding.message_event_id(),
+            delivery.binding.cause().clone(),
+        )
+        .expect("binding");
+        assert!(
+            claim_workflow_agent_delivery(
+                &pool,
+                community,
+                &target,
+                Some(delivery.id),
+                Some(&foreign_target),
+                30,
+            )
+            .await
+            .expect("claim")
+            .is_none(),
+            "an expected binding for another target must not claim this row"
+        );
+
+        // The row is untouched and still claimable under a scope-consistent
+        // binding.
+        assert!(
+            claim_workflow_agent_delivery(
+                &pool,
+                community,
+                &target,
+                Some(delivery.id),
+                Some(&delivery.binding),
+                30,
+            )
+            .await
+            .expect("claim")
+            .is_some(),
+            "a scope-consistent binding still claims"
         );
     }
 
