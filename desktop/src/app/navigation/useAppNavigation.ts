@@ -317,14 +317,15 @@ export function useAppNavigation() {
               threadRootId: options.threadRootId ?? null,
             }
           : undefined,
-        // Every channel navigation entry point funnels through here, so this
-        // is the single click-time anchor for the switch trace; it opens
-        // inside commitGuardedNavigation only after the navigation guard
-        // accepts. Re-selecting the already-active channel is a no-op
-        // navigation: the channel's effects never rerun, nothing would
-        // settle the trace, and it would squat on the singleton until
-        // timeout — so don't open one. (History back/forward bypasses
-        // goChannel entirely and is deliberately untraced.)
+        // Every channel navigation entry point funnels through here, so
+        // this is the single click-time anchor for the switch trace; it
+        // opens inside commitGuardedNavigation only after the navigation
+        // guard accepts. Navigations that stay on the already-active
+        // channel (exact re-click is a no-op; jump-to-message/autoSend/
+        // force change only search params) never re-run the channel's
+        // settle effects, so a trace could only time out — they stay
+        // untraced, as does history back/forward, which bypasses goChannel
+        // entirely.
         location.pathname.endsWith(`/channels/${channelId}`)
           ? undefined
           : channelId,

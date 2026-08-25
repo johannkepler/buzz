@@ -17,6 +17,10 @@
  * before the settled paint. A roster fetch that completes after settle is
  * deliberately not part of the felt switch latency, so such switches report
  * `members=cache` — by design, not omission.
+ *
+ * The settled timestamp lands one rAF after the paint, so `totalMs` includes
+ * up to one display refresh interval (~17ms at 60Hz, ~8ms at 120Hz) —
+ * compare before/after runs on the same display.
  */
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -263,13 +267,20 @@ const SETTLE_RENDER_WAIT_MS = 5_000;
  * the wait ends with the render still pending, the record must say so — the
  * >deadline tail is exactly what this tracer exists to expose, so the
  * measurement is kept but flagged rather than posing as an honest settled
- * paint. Pure for unit testing.
+ * paint. A trace older than the settle-entry timeout plus the render wait
+ * is frame-starved (hidden window, display sleep — rAF suspends there) and
+ * is dropped: nothing legitimate can reach that age, and recording it would
+ * charge the whole absence to the switch. Pure for unit testing.
  */
 export function resolveSettleWait(
   now: number,
   waitDeadline: number,
   renderPending: boolean,
-): "wait" | { settleWaitTruncated: boolean } {
+  startedAt: number,
+): "wait" | "drop" | { settleWaitTruncated: boolean } {
+  if (now - startedAt > SWITCH_TRACE_TIMEOUT_MS + SETTLE_RENDER_WAIT_MS) {
+    return "drop";
+  }
   if (renderPending && now < waitDeadline) return "wait";
   return { settleWaitTruncated: renderPending };
 }
@@ -299,6 +310,25 @@ export function settleChannelSwitchTrace(channelId: string): void {
     activeTrace = null;
     return;
   }
+  // rAF suspends entirely in hidden windows: a queued settle would fire
+  // only when the user returns, charging the whole absence to the switch as
+  // a clean record. Drop at settle when already hidden, and poison the wait
+  // if the window hides before the record lands — better no measurement
+  // than a fabricated one.
+  if (document.visibilityState === "hidden") {
+    activeTrace = null;
+    return;
+  }
+  let hiddenDuringWait = false;
+  const onVisibilityChange = () => {
+    hiddenDuringWait = true;
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange, {
+    once: true,
+  });
+  const stopWatchingVisibility = () => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  };
   // Keep the trace active through the deferred-commit wait so fetches that
   // finish inside the measured window still attribute to it. It is released
   // when the record lands; a newer switch's begin() simply replaces it.
@@ -306,6 +336,12 @@ export function settleChannelSwitchTrace(channelId: string): void {
   const record = (settleWaitTruncated: boolean) => {
     const settledAt = performance.now();
     if (activeTrace === trace) activeTrace = null;
+    // Keep only the latest switch in the User Timing buffer: desktop
+    // sessions run for weeks and the buffer is never GC'd. DevTools
+    // recordings capture entries at emit time, so clearing loses nothing.
+    performance.clearMarks(CHANNEL_SWITCH_START_MARK);
+    performance.clearMarks(CHANNEL_SWITCH_SETTLED_MARK);
+    performance.clearMeasures(CHANNEL_SWITCH_MEASURE);
     performance.mark(CHANNEL_SWITCH_SETTLED_MARK, {
       detail: { channelId },
     });
@@ -327,6 +363,10 @@ export function settleChannelSwitchTrace(channelId: string): void {
       buildSwitchPerfLogRecord(trace, settledAt, settleWaitTruncated),
     );
   };
+  const dropTrace = () => {
+    stopWatchingVisibility();
+    if (activeTrace === trace) activeTrace = null;
+  };
   const awaitDeferredCommit = () => {
     if (activeTrace !== trace) {
       // A newer switch replaced this trace, or a community reset dropped it.
@@ -334,19 +374,37 @@ export function settleChannelSwitchTrace(channelId: string): void {
       // own — recording would charge the replacement's delay to the settled
       // channel and could manufacture the very regression the tracer exists
       // to diagnose. Better no measurement than a fabricated one.
+      stopWatchingVisibility();
+      return;
+    }
+    if (hiddenDuringWait) {
+      dropTrace();
       return;
     }
     const decision = resolveSettleWait(
       performance.now(),
       waitDeadline,
       document.querySelector('[data-render-pending="true"]') !== null,
+      trace.startedAt,
     );
     if (decision === "wait") {
       window.requestAnimationFrame(awaitDeferredCommit);
       return;
     }
+    if (decision === "drop") {
+      dropTrace();
+      return;
+    }
     window.requestAnimationFrame(() => {
-      if (activeTrace !== trace) return;
+      if (activeTrace !== trace) {
+        stopWatchingVisibility();
+        return;
+      }
+      if (hiddenDuringWait) {
+        dropTrace();
+        return;
+      }
+      stopWatchingVisibility();
       record(decision.settleWaitTruncated);
     });
   };

@@ -10,8 +10,9 @@ import {
 import type { ChannelType } from "@/shared/api/types";
 
 /**
- * Switch-trace stage marks for the channel screen. Route commit fires on the
- * first render for the target channel; settle fires once its timeline leaves
+ * Switch-trace stage marks for the channel screen. Route commit fires in a
+ * layout effect — before the first paint — of the first commit where the
+ * target channel object has resolved; settle fires once its timeline leaves
  * the loading latch. Both are no-ops unless goChannel opened a trace for this
  * channel. Forum readiness is owned by ForumView's own queries, which the
  * timeline latch cannot observe — those traces are abandoned instead of
@@ -26,7 +27,9 @@ export function useChannelSwitchTraceMarks({
   activeChannelType: ChannelType | null;
   isTimelineLoading: boolean;
 }): void {
-  React.useEffect(() => {
+  // Layout effect: a passive effect flushes after paint, which would report
+  // "commit" as first-paint time rather than commit time.
+  React.useLayoutEffect(() => {
     if (activeChannelId) markChannelSwitchRouteCommit(activeChannelId);
   }, [activeChannelId]);
   // Route-exit cancellation: leaving the channel surface before the trace

@@ -7,12 +7,13 @@ import { installMockBridge } from "../helpers/bridge";
  *
  * Isolates how channel MEMBERSHIP SIZE scales the warm-switch cost, holding
  * message volume constant. Every channel object embeds its full
- * member-pubkey array, so membership size inflates (a) the get_channels
- * payload parsed on every poll, (b) the per-switch get_channel_members
- * response, and (c) every render-path pass over `channel.memberPubkeys` and
- * the member list (profile merges, agent-flag merges, mention candidates).
- * This spec is the instrument for that scaling: same channels, same rows,
- * member count is the only variable.
+ * member-pubkey array, so membership size inflates every render-path pass
+ * over `channel.memberPubkeys` and the member list (profile merges,
+ * agent-flag merges, mention candidates). NOTE: the mock bridge hands the
+ * app live JS objects — no IPC serialization or JSON parse — so the
+ * get_channels/get_channel_members parse cost that scales with membership
+ * in production is NOT exercised here; this instrument measures render-path
+ * scaling only. Same channels, same rows, member count the only variable.
  *
  * Two scenarios per member count:
  *   channel<->channel   — general <-> deep-history (150 fixed rows).
@@ -21,12 +22,15 @@ import { installMockBridge } from "../helpers/bridge";
  *                         (project enumeration, work items, repo snapshots,
  *                         activity summaries) on top of the shell, so this
  *                         axis captures the cross-surface switch the felt
- *                         1-2s report singled out. Readiness gates on the
- *                         surface's data-projects-hydrating marker, not just
- *                         the shell header — a sample whose query fan is
- *                         still loading must not count as settled. After the
- *                         untimed warmup both surfaces are cache-warm, so
- *                         measured samples are warm-switch commits.
+ *                         1-2s report singled out. Readiness requires the
+ *                         shell header AND the absence of the surface's
+ *                         data-projects-hydrating marker. The marker guards
+ *                         cold/invalidated samples whose query fan is still
+ *                         on first load; after the untimed warmup the fan is
+ *                         cached and renders synchronously, so measured
+ *                         samples are warm-switch commits (the marker never
+ *                         fires there — that is the warm contract, not a
+ *                         gap).
  *
  * Method mirrors warm-switch-markdown.perf.ts: in-page click + rAF polling
  * (CDP latency never pollutes samples), longtask capture per switch, 4x CPU
@@ -86,7 +90,10 @@ async function measureSwitch(
   },
 ): Promise<SwitchSample> {
   return page.evaluate(async (args) => {
-    const store = window as unknown as { __LONGTASKS__: number[] };
+    const store = window as unknown as {
+      __LONGTASKS__: number[];
+      __LONGTASK_OBSERVER__?: PerformanceObserver;
+    };
     store.__LONGTASKS__ = [];
     const link = document.querySelector<HTMLElement>(
       `[data-testid="${args.targetTestId}"]`,
@@ -123,6 +130,11 @@ async function measureSwitch(
     });
 
     const elapsed = performance.now() - start;
+    // Observer callbacks are delivered in a later task; drain the queue so
+    // a longtask ending just before the resolve frame isn't dropped.
+    for (const entry of store.__LONGTASK_OBSERVER__?.takeRecords() ?? []) {
+      store.__LONGTASKS__.push(entry.duration);
+    }
     const tasks = store.__LONGTASKS__ ?? [];
     return {
       ms: elapsed,
@@ -255,13 +267,19 @@ for (const memberCount of MEMBER_COUNTS) {
 
     // Arm the longtask observer; addInitScript applies on next navigation.
     await page.addInitScript(() => {
-      const store = window as unknown as { __LONGTASKS__?: number[] };
+      const store = window as unknown as {
+        __LONGTASKS__?: number[];
+        __LONGTASK_OBSERVER__?: PerformanceObserver;
+      };
       store.__LONGTASKS__ = [];
-      new PerformanceObserver((list) => {
+      const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           store.__LONGTASKS__?.push(entry.duration);
         }
-      }).observe({ type: "longtask", buffered: true });
+      });
+      observer.observe({ type: "longtask", buffered: true });
+      // Exposed so measureSwitch can drain takeRecords() at sample time.
+      store.__LONGTASK_OBSERVER__ = observer;
     });
     await page.reload();
     await page.waitForFunction(

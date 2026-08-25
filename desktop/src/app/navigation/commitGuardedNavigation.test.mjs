@@ -20,7 +20,12 @@ test("a refused navigation opens no trace; a later history settle records nothin
     requestAnimationFrame: (cb) => frames.push(cb) && frames.length,
     cancelAnimationFrame: () => {},
   };
-  globalThis.document = { querySelector: () => null };
+  globalThis.document = {
+    addEventListener: () => {},
+    querySelector: () => null,
+    removeEventListener: () => {},
+    visibilityState: "visible",
+  };
   performance.clearMeasures?.(CHANNEL_SWITCH_MEASURE);
   const unregister = registerNavigationGuard(() => false);
   try {

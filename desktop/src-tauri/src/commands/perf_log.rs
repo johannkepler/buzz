@@ -117,7 +117,12 @@ fn append_line_rotating(path: &std::path::Path, line: &str, max_bytes: u64) -> R
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    writeln!(file, "{line}").map_err(|e| e.to_string())
+    // One write_all, not writeln!: writeln! issues two write syscalls (line,
+    // then newline), and PERF_LOG_LOCK is process-local while the path is
+    // not — a second Buzz process sharing the log dir could interleave
+    // between them. A single O_APPEND write keeps lines atomic.
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 /// Appends one switch-perf record to the app-log-dir JSONL file and returns
@@ -323,9 +328,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(dir.join("switch-perf.jsonl.1"));
 
-        // 8 writers × 4 lines of 16 bytes = 512 bytes against a 384-byte cap:
-        // exactly one rotation boundary is crossed, so every line must land in
-        // either the live file or the single rotated generation. Unserialized
+        // 8 writers × 4 lines of 18 bytes on disk (17 chars + newline) = 576
+        // bytes against a 384-byte cap: the rotation boundary is crossed
+        // exactly once (at the 22nd line), so every line must land in either
+        // the live file or the single rotated generation. Unserialized
         // metadata→rename→append interleavings drop lines or fail renames.
         let threads: Vec<_> = (0..8)
             .map(|writer| {

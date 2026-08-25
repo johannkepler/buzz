@@ -182,8 +182,8 @@ export function ProjectsView() {
     snapshotProjects,
     activeCommunity?.reposDir,
   );
-  // Hydration marker for the switch-perf harness: the shell commits long
-  // before the query fan loads. isLoading so disabled queries never wedge it.
+  // Switch-perf hydration marker (shell commits long before the fan loads).
+  // isLoading: first load only — warm refetches/disabled queries stay false.
   const projectsHydrating =
     projectsQuery.isLoading ||
     projectsWorkItemsQuery.isLoading ||

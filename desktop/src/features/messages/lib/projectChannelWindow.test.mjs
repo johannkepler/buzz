@@ -429,7 +429,12 @@ test("canceled fetch never claims the switch trace's window slot; the accepted o
     requestAnimationFrame: (cb) => frames.push(cb) && frames.length,
     cancelAnimationFrame: () => {},
   };
-  globalThis.document = { querySelector: () => null };
+  globalThis.document = {
+    addEventListener: () => {},
+    querySelector: () => null,
+    removeEventListener: () => {},
+    visibilityState: "visible",
+  };
   const {
     beginChannelSwitchTrace,
     settleChannelSwitchTrace,

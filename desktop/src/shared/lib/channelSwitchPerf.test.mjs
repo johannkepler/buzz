@@ -107,15 +107,28 @@ test("settle drops a trace that has timed out", () => {
 
 test("the settle wait records truncated — never as an honest settle — at deadline", () => {
   // Still pending, before the deadline: keep waiting.
-  assert.equal(resolveSettleWait(4_999, 5_000, true), "wait");
+  assert.equal(resolveSettleWait(4_999, 5_000, true, 0), "wait");
   // Render caught up: record cleanly.
-  assert.deepEqual(resolveSettleWait(1_000, 5_000, false), {
+  assert.deepEqual(resolveSettleWait(1_000, 5_000, false, 0), {
     settleWaitTruncated: false,
   });
   // Deadline expired while still pending: the record must say so — a >5s
   // switch reported as an ordinary settle would hide exactly the tail this
   // tracer exists to expose.
-  assert.deepEqual(resolveSettleWait(5_000, 5_000, true), {
+  assert.deepEqual(resolveSettleWait(5_000, 5_000, true, 0), {
+    settleWaitTruncated: true,
+  });
+});
+
+test("a frame-starved trace is dropped, not recorded as a clean settle", () => {
+  // rAF suspends in hidden windows, so a queued settle can fire minutes
+  // after the click with renderPending long since false — the absence must
+  // not be charged to the switch. Nothing legitimate can be older than the
+  // 30s settle-entry timeout plus the 5s render wait.
+  assert.equal(resolveSettleWait(35_001, 40_000, false, 0), "drop");
+  assert.equal(resolveSettleWait(35_001, 40_000, true, 0), "drop");
+  // At the bound (a 29.9s settle plus a truncated 5s wait) records survive.
+  assert.deepEqual(resolveSettleWait(35_000, 34_900, true, 0), {
     settleWaitTruncated: true,
   });
 });
@@ -145,7 +158,7 @@ test("fetches attribute only when started after the switch began", () => {
 
 // --- Settle lifecycle: rapid switches and community resets ----------------
 
-async function withSettleHarness(run) {
+async function withSettleHarness(run, documentOverrides = {}) {
   const frames = [];
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
@@ -153,7 +166,13 @@ async function withSettleHarness(run) {
     requestAnimationFrame: (cb) => frames.push(cb) && frames.length,
     cancelAnimationFrame: () => {},
   };
-  globalThis.document = { querySelector: () => null };
+  globalThis.document = {
+    addEventListener: () => {},
+    querySelector: () => null,
+    removeEventListener: () => {},
+    visibilityState: "visible",
+    ...documentOverrides,
+  };
   const {
     abandonChannelSwitchTrace,
     beginChannelSwitchTrace,
@@ -227,6 +246,44 @@ test("an undisturbed settle records exactly one measure", async () => {
     flush();
     assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
   });
+});
+
+test("a settle in a hidden window drops the trace instead of recording", async () => {
+  await withSettleHarness(
+    async ({ begin, settle, flush, measures }) => {
+      begin("aaaa1111aaaa1111");
+      // rAF is suspended while hidden; the queued chain would only fire when
+      // the user returns, charging the whole absence to the switch.
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), []);
+      // The trace was released, not wedged: a later stale settle is a no-op.
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), []);
+    },
+    { visibilityState: "hidden" },
+  );
+});
+
+test("a window hidden during the settle wait drops the record", async () => {
+  const visibilityListeners = [];
+  await withSettleHarness(
+    async ({ begin, settle, flush, measures }) => {
+      begin("aaaa1111aaaa1111");
+      settle("aaaa1111aaaa1111");
+      assert.equal(visibilityListeners.length, 1, "wait registers a listener");
+      // The user cmd-tabs away mid-wait; frames resume only on return.
+      visibilityListeners[0]();
+      flush();
+      assert.deepEqual(measures(), []);
+    },
+    {
+      addEventListener: (type, listener) => {
+        if (type === "visibilitychange") visibilityListeners.push(listener);
+      },
+    },
+  );
 });
 
 test("a scheduled route-exit abandon canceled in the same task keeps the trace", async () => {
