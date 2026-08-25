@@ -192,8 +192,35 @@ export function cancelRouteExitAbandon(channelId: string): void {
   pendingRouteExitAbandons.delete(channelId);
 }
 
+/**
+ * Timestamp of the most recent visibilitychange. rAF suspends and network
+ * work throttles while the window is hidden, so any visibility transition
+ * inside a trace window means an off-screen interval overlaps the
+ * measurement — such traces are dropped rather than charged with the
+ * absence. One listener per document (tests swap documents).
+ */
+let lastVisibilityChangeAt = Number.NEGATIVE_INFINITY;
+const watchedDocuments = new WeakSet<object>();
+
+function ensureVisibilityWatcher(): void {
+  if (typeof document === "undefined" || !document.addEventListener) return;
+  if (watchedDocuments.has(document)) return;
+  watchedDocuments.add(document);
+  document.addEventListener("visibilitychange", () => {
+    lastVisibilityChangeAt = performance.now();
+  });
+}
+
+function traceOverlapsHiddenWindow(trace: ChannelSwitchTrace): boolean {
+  return (
+    document.visibilityState === "hidden" ||
+    lastVisibilityChangeAt >= trace.startedAt
+  );
+}
+
 export function beginChannelSwitchTrace(channelId: string): void {
   if (typeof performance === "undefined") return;
+  ensureVisibilityWatcher();
   activeTrace = {
     channelId,
     startedAt: performance.now(),
@@ -201,12 +228,15 @@ export function beginChannelSwitchTrace(channelId: string): void {
     windowFetch: null,
     membersFetch: null,
   };
-  // Clear the previous start mark here, not only in record(): traces that
+  // Clear the whole previous switch here, not only in record(): traces that
   // die without recording (forum visits, route exits, drops) never reach
-  // record()'s buffer clearing, and weeks-long sessions would accumulate a
-  // stray mark per abandon. Clearing at begin bounds the buffer to one
-  // start mark no matter how the previous trace ended.
+  // record()'s buffer clearing — weeks-long sessions would accumulate a
+  // stray start mark per abandon — and a consumer polling the buffer
+  // mid-switch (Playwright specs, Performance panel) must never read the
+  // previous switch's settled mark or measure as the current one's.
   performance.clearMarks(CHANNEL_SWITCH_START_MARK);
+  performance.clearMarks(CHANNEL_SWITCH_SETTLED_MARK);
+  performance.clearMeasures(CHANNEL_SWITCH_MEASURE);
   performance.mark(CHANNEL_SWITCH_START_MARK, { detail: { channelId } });
 }
 
@@ -273,10 +303,15 @@ const SETTLE_RENDER_WAIT_MS = 5_000;
  * the wait ends with the render still pending, the record must say so — the
  * >deadline tail is exactly what this tracer exists to expose, so the
  * measurement is kept but flagged rather than posing as an honest settled
- * paint. A trace older than the settle-entry timeout plus the render wait
- * is frame-starved (hidden window, display sleep — rAF suspends there) and
- * is dropped: nothing legitimate can reach that age, and recording it would
- * charge the whole absence to the switch. Pure for unit testing.
+ * paint. Frame starvation is dropped, not recorded: a healthy chain with
+ * nothing pending records within a frame or two of settle entry, so a
+ * not-pending frame landing past the wait deadline means the gap was rAF
+ * suspension (system suspend, App Nap — cases that fire no
+ * visibilitychange), not render time. A trace older than the settle-entry
+ * timeout plus the render wait is dropped on the same grounds regardless of
+ * pending state. The rare honest render that catches up within one frame of
+ * the deadline is sacrificed by the first rule — better no measurement than
+ * a fabricated one. Pure for unit testing.
  */
 export function resolveSettleWait(
   now: number,
@@ -287,6 +322,7 @@ export function resolveSettleWait(
   if (now - startedAt > SWITCH_TRACE_TIMEOUT_MS + SETTLE_RENDER_WAIT_MS) {
     return "drop";
   }
+  if (!renderPending && now > waitDeadline) return "drop";
   if (renderPending && now < waitDeadline) return "wait";
   return { settleWaitTruncated: renderPending };
 }
@@ -316,25 +352,16 @@ export function settleChannelSwitchTrace(channelId: string): void {
     activeTrace = null;
     return;
   }
-  // rAF suspends entirely in hidden windows: a queued settle would fire
-  // only when the user returns, charging the whole absence to the switch as
-  // a clean record. Drop at settle when already hidden, and poison the wait
-  // if the window hides before the record lands — better no measurement
-  // than a fabricated one.
-  if (document.visibilityState === "hidden") {
+  // rAF suspends and network work throttles in hidden windows: a hidden
+  // interval anywhere between the click and the recorded settle would be
+  // charged to the switch as a clean record. Drop when the window is hidden
+  // now or any visibility transition happened since the click — better no
+  // measurement than a fabricated one.
+  ensureVisibilityWatcher();
+  if (traceOverlapsHiddenWindow(trace)) {
     activeTrace = null;
     return;
   }
-  let hiddenDuringWait = false;
-  const onVisibilityChange = () => {
-    hiddenDuringWait = true;
-  };
-  document.addEventListener("visibilitychange", onVisibilityChange, {
-    once: true,
-  });
-  const stopWatchingVisibility = () => {
-    document.removeEventListener("visibilitychange", onVisibilityChange);
-  };
   // Keep the trace active through the deferred-commit wait so fetches that
   // finish inside the measured window still attribute to it. It is released
   // when the record lands; a newer switch's begin() simply replaces it.
@@ -370,7 +397,6 @@ export function settleChannelSwitchTrace(channelId: string): void {
     );
   };
   const dropTrace = () => {
-    stopWatchingVisibility();
     if (activeTrace === trace) activeTrace = null;
   };
   const awaitDeferredCommit = () => {
@@ -380,10 +406,9 @@ export function settleChannelSwitchTrace(channelId: string): void {
       // own — recording would charge the replacement's delay to the settled
       // channel and could manufacture the very regression the tracer exists
       // to diagnose. Better no measurement than a fabricated one.
-      stopWatchingVisibility();
       return;
     }
-    if (hiddenDuringWait) {
+    if (traceOverlapsHiddenWindow(trace)) {
       dropTrace();
       return;
     }
@@ -402,15 +427,11 @@ export function settleChannelSwitchTrace(channelId: string): void {
       return;
     }
     window.requestAnimationFrame(() => {
-      if (activeTrace !== trace) {
-        stopWatchingVisibility();
-        return;
-      }
-      if (hiddenDuringWait) {
+      if (activeTrace !== trace) return;
+      if (traceOverlapsHiddenWindow(trace)) {
         dropTrace();
         return;
       }
-      stopWatchingVisibility();
       record(decision.settleWaitTruncated);
     });
   };

@@ -133,6 +133,19 @@ test("a frame-starved trace is dropped, not recorded as a clean settle", () => {
   });
 });
 
+test("a not-pending frame landing past the wait deadline is starvation, not a settle", () => {
+  // Settle entered at t=1s (deadline 6s), render caught up, then frames
+  // stalled (system suspend, App Nap — no visibilitychange): the next frame
+  // lands at t=20s with nothing pending. The gap is starvation; recording
+  // it would fabricate a clean 20s switch well under the 35s age guard.
+  assert.equal(resolveSettleWait(20_000, 6_000, false, 0), "drop");
+  // Still-pending arrivals past the deadline remain truncated records: the
+  // render genuinely wasn't done, which is the tail the tracer must keep.
+  assert.deepEqual(resolveSettleWait(6_001, 6_000, true, 0), {
+    settleWaitTruncated: true,
+  });
+});
+
 test("a truncated settle is flagged in the summary and the log record", () => {
   const summary = summarizeChannelSwitchTrace(trace(), 1_412, true);
   assert.ok(summary.endsWith(" settle=truncated"), summary);
@@ -246,6 +259,51 @@ test("an undisturbed settle records exactly one measure", async () => {
     flush();
     assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
   });
+});
+
+test("beginning a switch clears the previous switch's settled mark and measure", async () => {
+  await withSettleHarness(async ({ begin, settle, flush, measures }) => {
+    const { CHANNEL_SWITCH_SETTLED_MARK } = await import(
+      "./channelSwitchPerf.ts"
+    );
+    begin("aaaa1111aaaa1111");
+    settle("aaaa1111aaaa1111");
+    flush();
+    assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
+    // A consumer polling the buffer mid-switch (the Playwright specs, the
+    // Performance panel) must never read the PREVIOUS switch's entries as
+    // the current one's.
+    begin("bbbb2222bbbb2222");
+    assert.deepEqual(measures(), []);
+    assert.equal(
+      performance.getEntriesByName(CHANNEL_SWITCH_SETTLED_MARK).length,
+      0,
+    );
+  });
+});
+
+test("a window hidden between click and settle entry drops the trace", async () => {
+  const visibilityListeners = [];
+  await withSettleHarness(
+    async ({ begin, settle, flush, measures }) => {
+      begin("aaaa1111aaaa1111");
+      assert.ok(visibilityListeners.length >= 1, "watcher armed at begin");
+      // The window hides while the fetch is in flight (cmd-H / minimize),
+      // then the user returns and the settle runs with the window visible
+      // again: the absence sits inside totalMs, so the trace must drop.
+      globalThis.document.visibilityState = "hidden";
+      for (const listener of visibilityListeners) listener();
+      globalThis.document.visibilityState = "visible";
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), []);
+    },
+    {
+      addEventListener: (type, listener) => {
+        if (type === "visibilitychange") visibilityListeners.push(listener);
+      },
+    },
+  );
 });
 
 test("abandoned switches never accumulate start marks", async () => {
