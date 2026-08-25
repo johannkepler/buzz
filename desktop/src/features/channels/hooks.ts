@@ -42,7 +42,10 @@ import type {
 } from "@/shared/api/tauriChannels";
 import { mergeConcurrentChannelRecency } from "@/features/channels/lib/channelRecencyMerge";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { traceChannelMembersFetch } from "@/shared/lib/channelSwitchPerf";
+import {
+  openChannelMembersFetch,
+  traceChannelMembersFetch,
+} from "@/shared/lib/channelSwitchPerf";
 import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
@@ -560,23 +563,25 @@ export function useChannelMembersQuery(
   return useQuery({
     enabled: enabled && channelId !== null,
     queryKey: ["channels", channelId ?? "none", "members"],
-    queryFn: async ({ signal }) => {
+    queryFn: async () => {
       if (!channelId) {
         throw new Error("No channel selected.");
       }
 
+      // Supersession token, NOT the query's AbortSignal: reading the signal
+      // getter flips React Query to cancel-and-revert when the last observer
+      // unsubscribes mid-fetch, which would discard warm rosters on
+      // interrupted switches. The token keeps stale fetches (replaced by a
+      // live join/leave invalidation) out of the trace's one-shot slot.
+      const fetchAttempt = openChannelMembersFetch(channelId);
       const fetchStartedAt = performance.now();
       const members = await getChannelMembers(channelId);
-      // Attribute only accepted fetches: a live join/leave invalidation
-      // cancels and replaces an in-flight roster refetch, and the superseded
-      // fetch must not claim the trace's one-shot membersFetch slot with a
-      // stale count — same rule as the window fetch's reconcile abort gate.
-      signal.throwIfAborted();
       traceChannelMembersFetch(
         channelId,
         members.length,
         performance.now() - fetchStartedAt,
         fetchStartedAt,
+        fetchAttempt,
       );
       return members;
     },

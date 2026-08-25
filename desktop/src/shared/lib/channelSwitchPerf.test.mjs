@@ -186,6 +186,59 @@ test("fetches attribute only when started after the switch began", () => {
   assert.equal(shouldAttributeFetch(null, "abcdef1234567890", 1_500), false);
 });
 
+test("a superseded members fetch never claims the trace's one-shot slot", async () => {
+  const { openChannelMembersFetch, traceChannelMembersFetch } = await import(
+    "./channelSwitchPerf.ts"
+  );
+  await withSettleHarness(async ({ begin, settle, flush }) => {
+    begin("aaaa1111aaaa1111");
+    const startedAt = performance.now();
+    // Fetch #1 starts, then a live join/leave invalidation replaces it with
+    // fetch #2. #1 resolves first (the Tauri call can't be cancelled) but
+    // must not attribute: its roster is not the one rendered. The query's
+    // AbortSignal is deliberately not used for this — consuming it flips
+    // React Query to cancel-and-revert on last-observer unsubscribe, which
+    // discards warm rosters on interrupted switches.
+    const first = openChannelMembersFetch("aaaa1111aaaa1111");
+    const second = openChannelMembersFetch("aaaa1111aaaa1111");
+    traceChannelMembersFetch("aaaa1111aaaa1111", 9_999, 900, startedAt, first);
+    traceChannelMembersFetch(
+      "aaaa1111aaaa1111",
+      10_002,
+      120,
+      startedAt,
+      second,
+    );
+    settle("aaaa1111aaaa1111");
+    flush();
+    const measure = performance
+      .getEntriesByName("buzz:channel-switch:click-to-settled")
+      .at(-1);
+    assert.equal(measure?.detail?.membersFetch?.memberCount, 10_002);
+    assert.equal(measure?.detail?.membersFetch?.durationMs, 120);
+  });
+});
+
+test("a suspension before the first settle frame drops, not records truncated", async () => {
+  await withSettleHarness(async ({ begin, settle, flush, measures }) => {
+    const virtualClock = { now: 0 };
+    performance.now = () => virtualClock.now;
+    try {
+      // The deferred marker stays latched during a suspension, so its truth
+      // is not evidence of slow rendering — the settle-entry → first-frame
+      // window must be starvation-guarded like every later frame.
+      globalThis.document.querySelector = () => ({});
+      begin("aaaa1111aaaa1111");
+      settle("aaaa1111aaaa1111");
+      virtualClock.now = 20_000;
+      flush();
+      assert.deepEqual(measures(), []);
+    } finally {
+      delete performance.now;
+    }
+  });
+});
+
 // --- Settle lifecycle: rapid switches and community resets ----------------
 
 async function withSettleHarness(run, documentOverrides = {}) {

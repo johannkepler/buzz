@@ -300,12 +300,38 @@ export function traceChannelWindowFetch(
   activeTrace.windowFetch ??= { durationMs, eventCount };
 }
 
+/**
+ * Per-channel roster-fetch sequence numbers. A live join/leave invalidation
+ * cancels-and-replaces an in-flight roster refetch, but the underlying
+ * Tauri call cannot be cancelled — the superseded fetch still resolves and
+ * must not claim the trace's one-shot slot with a stale count. The query's
+ * AbortSignal is deliberately NOT used for this: merely reading
+ * `context.signal` flips React Query to cancel-and-revert when the last
+ * observer unsubscribes mid-fetch, discarding warm rosters on interrupted
+ * switches (a product-behavior change this instrumentation must not make).
+ */
+const channelMembersFetchSequences = new Map<string, number>();
+
+/** Registers a roster fetch attempt; pass the token to traceChannelMembersFetch. */
+export function openChannelMembersFetch(channelId: string): number {
+  const next = (channelMembersFetchSequences.get(channelId) ?? 0) + 1;
+  channelMembersFetchSequences.set(channelId, next);
+  return next;
+}
+
 export function traceChannelMembersFetch(
   channelId: string,
   memberCount: number,
   durationMs: number,
   fetchStartedAt: number,
+  fetchAttempt?: number,
 ): void {
+  if (
+    fetchAttempt !== undefined &&
+    channelMembersFetchSequences.get(channelId) !== fetchAttempt
+  ) {
+    return;
+  }
   if (!shouldAttributeFetch(activeTrace, channelId, fetchStartedAt)) return;
   activeTrace.membersFetch ??= { durationMs, memberCount };
 }
@@ -319,6 +345,7 @@ export function traceChannelMembersFetch(
 export function resetChannelSwitchTrace(): void {
   activeTrace = null;
   pendingRouteExitAbandons.clear();
+  channelMembersFetchSequences.clear();
 }
 
 /** Bound on waiting for the deferred timeline commit before recording. */
@@ -440,7 +467,10 @@ export function settleChannelSwitchTrace(channelId: string): void {
   const dropTrace = () => {
     if (activeTrace === trace) activeTrace = null;
   };
-  let lastFrameAt: number | null = null;
+  // Seeded now, not on the first frame: the settle-entry → first-frame
+  // window must be starvation-guarded too, or a suspension there records a
+  // truncated measure inflated by the whole stall.
+  let lastFrameAt: number | null = performance.now();
   const awaitDeferredCommit = () => {
     if (activeTrace !== trace) {
       // A newer switch replaced this trace, or a community reset dropped it.
