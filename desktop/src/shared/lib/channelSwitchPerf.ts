@@ -111,8 +111,15 @@ export function buildSwitchPerfLogRecord(
 }
 
 let hasAnnouncedLogPath = false;
+let hasWarnedSinkFailure = false;
 
-/** Fire-and-forget JSONL append; diagnostics must never surface failures. */
+/**
+ * Fire-and-forget JSONL append; diagnostics must never throw into the app.
+ * A permanently dead sink must not be SILENT though — the console keeps
+ * printing per-switch lines that read as "tracing works", so warn once when
+ * persistence fails or an operator's before/after run yields an empty file
+ * with no way to tell why.
+ */
 function appendSwitchPerfLogRecord(record: Record<string, unknown>): void {
   if (!isTauri()) return;
   void invoke<string>("append_switch_perf_log", {
@@ -124,7 +131,15 @@ function appendSwitchPerfLogRecord(record: Record<string, unknown>): void {
         console.info(`[switch-perf] logging to ${path}`);
       }
     })
-    .catch(() => {});
+    .catch((error) => {
+      if (!hasWarnedSinkFailure) {
+        hasWarnedSinkFailure = true;
+        console.warn(
+          "[switch-perf] failed to persist record; offline log may be incomplete:",
+          error,
+        );
+      }
+    });
 }
 
 /**
@@ -310,6 +325,14 @@ export function resetChannelSwitchTrace(): void {
 const SETTLE_RENDER_WAIT_MS = 5_000;
 
 /**
+ * Largest inter-frame gap attributable to real main-thread work (heavy
+ * long tasks run a few hundred ms; 4x-throttled harness frames stay well
+ * under this). Anything larger is rAF starvation — suspension without a
+ * visibilitychange — and the sample drops.
+ */
+const MAX_SETTLE_FRAME_GAP_MS = 3_000;
+
+/**
  * Per-frame decision for the bounded settle wait: keep waiting only while
  * the deferred render is still pending AND the deadline hasn't passed. When
  * the wait ends with the render still pending, the record must say so — the
@@ -321,17 +344,23 @@ const SETTLE_RENDER_WAIT_MS = 5_000;
  * suspension (system suspend, App Nap — cases that fire no
  * visibilitychange), not render time. A trace older than the settle-entry
  * timeout plus the render wait is dropped on the same grounds regardless of
- * pending state. The rare honest render that catches up within one frame of
- * the deadline is sacrificed by the first rule — better no measurement than
- * a fabricated one. Pure for unit testing.
+ * pending state, as is a single inter-frame gap beyond any plausible
+ * main-thread stall — a suspension latches the pending marker, so its truth
+ * is not evidence the render was slow. The rare honest render that catches
+ * up within one frame of the deadline is sacrificed by these rules — better
+ * no measurement than a fabricated one. Pure for unit testing.
  */
 export function resolveSettleWait(
   now: number,
   waitDeadline: number,
   renderPending: boolean,
   startedAt: number,
+  frameGapMs: number | null = null,
 ): "wait" | "drop" | { settleWaitTruncated: boolean } {
   if (now - startedAt > SWITCH_TRACE_TIMEOUT_MS + SETTLE_RENDER_WAIT_MS) {
+    return "drop";
+  }
+  if (frameGapMs !== null && frameGapMs > MAX_SETTLE_FRAME_GAP_MS) {
     return "drop";
   }
   if (!renderPending && now > waitDeadline) return "drop";
@@ -411,6 +440,7 @@ export function settleChannelSwitchTrace(channelId: string): void {
   const dropTrace = () => {
     if (activeTrace === trace) activeTrace = null;
   };
+  let lastFrameAt: number | null = null;
   const awaitDeferredCommit = () => {
     if (activeTrace !== trace) {
       // A newer switch replaced this trace, or a community reset dropped it.
@@ -424,11 +454,15 @@ export function settleChannelSwitchTrace(channelId: string): void {
       dropTrace();
       return;
     }
+    const now = performance.now();
+    const frameGapMs = lastFrameAt === null ? null : now - lastFrameAt;
+    lastFrameAt = now;
     const decision = resolveSettleWait(
-      performance.now(),
+      now,
       waitDeadline,
       document.querySelector('[data-render-pending="true"]') !== null,
       trace.startedAt,
+      frameGapMs,
     );
     if (decision === "wait") {
       window.requestAnimationFrame(awaitDeferredCommit);

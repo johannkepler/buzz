@@ -146,6 +146,23 @@ test("a not-pending frame landing past the wait deadline is starvation, not a se
   });
 });
 
+test("a starved frame gap drops even while the render-pending marker is latched", () => {
+  // During a suspension React can't flush the deferred commit, so the
+  // pending marker stays latched — its truth is NOT evidence the render was
+  // slow. A single inter-frame gap beyond any plausible main-thread stall
+  // means the process was suspended; recording a truncated 22s "switch"
+  // would fabricate the very regression the tracer hunts.
+  assert.equal(resolveSettleWait(22_300, 5_300, true, 0, 22_000), "drop");
+  // Heavy-but-real frames (multi-hundred-ms long tasks) still record.
+  assert.deepEqual(resolveSettleWait(5_400, 5_300, true, 0, 900), {
+    settleWaitTruncated: true,
+  });
+  // The first frame has no predecessor: no gap to judge.
+  assert.deepEqual(resolveSettleWait(1_000, 5_300, false, 0, null), {
+    settleWaitTruncated: false,
+  });
+});
+
 test("a truncated settle is flagged in the summary and the log record", () => {
   const summary = summarizeChannelSwitchTrace(trace(), 1_412, true);
   assert.ok(summary.endsWith(" settle=truncated"), summary);

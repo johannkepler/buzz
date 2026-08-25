@@ -560,13 +560,18 @@ export function useChannelMembersQuery(
   return useQuery({
     enabled: enabled && channelId !== null,
     queryKey: ["channels", channelId ?? "none", "members"],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       if (!channelId) {
         throw new Error("No channel selected.");
       }
 
       const fetchStartedAt = performance.now();
       const members = await getChannelMembers(channelId);
+      // Attribute only accepted fetches: a live join/leave invalidation
+      // cancels and replaces an in-flight roster refetch, and the superseded
+      // fetch must not claim the trace's one-shot membersFetch slot with a
+      // stale count — same rule as the window fetch's reconcile abort gate.
+      signal.throwIfAborted();
       traceChannelMembersFetch(
         channelId,
         members.length,
