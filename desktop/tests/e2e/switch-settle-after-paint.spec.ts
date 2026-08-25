@@ -130,14 +130,18 @@ test("settle waits for a delayed lazy channel-pane chunk", async ({ page }) => {
       elapsedSinceClick: start ? performance.now() - start.startTime : null,
     };
   }, SWITCH_MEASURE);
-  expect(
-    early.elapsedSinceClick,
-    "harness overhead consumed the tracer's settle deadline — timing, not a tracer bug",
-  ).toBeLessThan(4_500);
+  // Order matters: a clean measure recorded behind the held chunk — the
+  // regression under test — clears the start mark, nulling elapsedSinceClick.
+  // Asserting the budget first would then fail with a "rerun, not a tracer
+  // bug" message that states the opposite of the truth.
   expect(
     early.cleanMeasures,
     "no clean settle may be recorded while the pane chunk is suspended",
   ).toBe(0);
+  expect(
+    early.elapsedSinceClick,
+    "harness overhead consumed the tracer's settle deadline — timing, not a tracer bug",
+  ).toBeLessThan(4_500);
 
   releaseChunk();
 
