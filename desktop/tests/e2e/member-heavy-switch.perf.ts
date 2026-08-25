@@ -94,6 +94,10 @@ async function measureSwitch(
       __LONGTASKS__: number[];
       __LONGTASK_OBSERVER__?: PerformanceObserver;
     };
+    // Discard pending deliveries from BEFORE this sample: a longtask
+    // trailing the previous switch is delivered in a later task and would
+    // otherwise land in this sample's fresh array.
+    store.__LONGTASK_OBSERVER__?.takeRecords();
     store.__LONGTASKS__ = [];
     const link = document.querySelector<HTMLElement>(
       `[data-testid="${args.targetTestId}"]`,
