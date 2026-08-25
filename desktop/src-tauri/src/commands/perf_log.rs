@@ -368,10 +368,12 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("switch-perf.jsonl.1"));
 
         // 8 writers × 4 lines of 18 bytes on disk (17 chars + newline) = 576
-        // bytes against a 384-byte cap: the rotation boundary is crossed
-        // exactly once (at the 22nd line), so every line must land in either
-        // the live file or the single rotated generation. Unserialized
-        // metadata→rename→append interleavings drop lines or fail renames.
+        // bytes against a 384-byte cap: rotation triggers before the 23rd
+        // append (22 lines = 396 bytes ≥ 384) and the ≤10 lines that follow
+        // (≤180 bytes) cannot re-trigger it, so the boundary is crossed
+        // exactly once and every line must land in either the live file or
+        // the single rotated generation. Unserialized metadata→rename→append
+        // interleavings drop lines or fail renames.
         let threads: Vec<_> = (0..8)
             .map(|writer| {
                 let path = path.clone();
@@ -396,9 +398,12 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect();
-        if let Ok(rotated) = std::fs::read_to_string(dir.join("switch-perf.jsonl.1")) {
-            lines.extend(rotated.lines().map(str::to_string));
-        }
+        // Unconditional: if rotation never fired under contention, the size
+        // cap is inoperative and this test must fail, not silently pass with
+        // all 32 lines in the live file.
+        let rotated = std::fs::read_to_string(dir.join("switch-perf.jsonl.1"))
+            .expect("rotation must have occurred under contention");
+        lines.extend(rotated.lines().map(str::to_string));
         lines.sort();
         let expected: Vec<String> = (0..8)
             .flat_map(|writer| {

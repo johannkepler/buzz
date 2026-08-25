@@ -416,7 +416,9 @@ export function settleChannelSwitchTrace(channelId: string): void {
     return;
   }
   const trace = settledTrace;
-  if (typeof window === "undefined") {
+  // Both globals gate the whole settle path: the wait loop reads
+  // document.visibilityState and querySelector unguarded past this point.
+  if (typeof window === "undefined" || typeof document === "undefined") {
     activeTrace = null;
     return;
   }
