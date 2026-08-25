@@ -27,11 +27,18 @@ test("cold-switch settle measure lands only after rows are painted", async ({
 
   // Poll for the settle measure inside the page and — in the same synchronous
   // evaluation turn — snapshot what the DOM shows at that moment. Reading the
-  // DOM from the test process after the fact would race further renders.
+  // DOM from the test process after the fact would race further renders. Only
+  // CLEAN measures count: a truncated one means the tracer honestly hit its
+  // render-wait deadline (harness timing), which must fail with that reason
+  // rather than masquerading as a tracer regression.
   const atSettle = await page.evaluate(async (measureName) => {
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
-      if (performance.getEntriesByName(measureName).length > 0) {
+      const entries = performance.getEntriesByName(measureName);
+      const clean = entries.filter(
+        (entry) => !(entry as PerformanceMeasure).detail?.settleWaitTruncated,
+      );
+      if (clean.length > 0) {
         return {
           renderPending:
             document.querySelector('[data-render-pending="true"]') !== null,
@@ -39,13 +46,31 @@ test("cold-switch settle measure lands only after rows are painted", async ({
             '[data-message-id^="mock-deep-history-"]',
           ).length,
           settled: true,
+          truncatedOnly: false,
+        };
+      }
+      if (entries.length > 0) {
+        return {
+          renderPending: true,
+          rowCount: 0,
+          settled: false,
+          truncatedOnly: true,
         };
       }
       await new Promise((resolve) => setTimeout(resolve, 16));
     }
-    return { renderPending: true, rowCount: 0, settled: false };
+    return {
+      renderPending: true,
+      rowCount: 0,
+      settled: false,
+      truncatedOnly: false,
+    };
   }, SWITCH_MEASURE);
 
+  expect(
+    atSettle.truncatedOnly,
+    "tracer truncated at its render-wait deadline — harness timing exhausted, not a tracer bug; rerun",
+  ).toBe(false);
   expect(atSettle.settled, "switch trace must settle").toBe(true);
   expect(
     atSettle.rowCount,
@@ -117,23 +142,37 @@ test("settle waits for a delayed lazy channel-pane chunk", async ({ page }) => {
   releaseChunk();
 
   // Same in-page polling as above: snapshot the DOM in the evaluation turn
-  // where the measure first exists.
+  // where the first CLEAN measure exists. A truncated measure here means the
+  // released chunk's mount outran the remaining render-wait budget — a
+  // harness timing exhaustion, and it must fail with that reason.
   const atSettle = await page.evaluate(async (measureName) => {
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
-      if (performance.getEntriesByName(measureName).length > 0) {
+      const entries = performance.getEntriesByName(measureName);
+      const clean = entries.filter(
+        (entry) => !(entry as PerformanceMeasure).detail?.settleWaitTruncated,
+      );
+      if (clean.length > 0) {
         return {
           rowCount: document.querySelectorAll(
             '[data-message-id^="mock-deep-history-"]',
           ).length,
           settled: true,
+          truncatedOnly: false,
         };
+      }
+      if (entries.length > 0) {
+        return { rowCount: 0, settled: false, truncatedOnly: true };
       }
       await new Promise((resolve) => setTimeout(resolve, 16));
     }
-    return { rowCount: 0, settled: false };
+    return { rowCount: 0, settled: false, truncatedOnly: false };
   }, SWITCH_MEASURE);
 
+  expect(
+    atSettle.truncatedOnly,
+    "tracer truncated before the released chunk painted — harness timing exhausted, not a tracer bug; rerun",
+  ).toBe(false);
   expect(atSettle.settled, "switch trace must settle after release").toBe(true);
   expect(
     atSettle.rowCount,
