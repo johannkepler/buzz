@@ -458,6 +458,32 @@ test("a scheduled route-exit abandon canceled in the same task keeps the trace",
   );
 });
 
+test("the trace anchors at the input event, not handler dispatch", async () => {
+  await withSettleHarness(async ({ begin, settle, flush }) => {
+    // Real-clock gap: earlier tests fired visibilitychange listeners, and a
+    // back-dated anchor overlapping those timestamps is (correctly) dropped
+    // by the hidden-window guard. Let them age out first.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    // A click can sit queued behind a long task before its handler runs;
+    // that input delay is felt switch latency and must be inside totalMs.
+    // window.event is set only during synchronous dispatch, so this anchor
+    // can never leak in from async continuations.
+    globalThis.window.event = { timeStamp: performance.now() - 550 };
+    begin("aaaa1111aaaa1111");
+    delete globalThis.window.event;
+    settle("aaaa1111aaaa1111");
+    flush();
+    const measure = performance
+      .getEntriesByName("buzz:channel-switch:click-to-settled")
+      .at(-1);
+    assert.ok(measure, "measure recorded");
+    assert.ok(
+      measure.duration >= 550,
+      `input delay must be inside the measure (got ${measure.duration})`,
+    );
+  });
+});
+
 test("beginning a switch revokes a pending route-exit abandon for that channel", async () => {
   await withSettleHarness(
     async ({ begin, scheduleAbandon, settle, flush, measures }) => {

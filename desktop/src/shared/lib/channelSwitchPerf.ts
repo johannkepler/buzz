@@ -252,9 +252,21 @@ export function beginChannelSwitchTrace(channelId: string): void {
   // cleanup's scheduled abandon pending; it must not kill the fresh trace
   // when its microtask drains.
   cancelRouteExitAbandon(channelId);
+  // Anchor at the triggering input event when one is dispatching: a click
+  // can sit queued behind a long task before its handler runs, and that
+  // input delay is felt switch latency. window.event is set only during
+  // synchronous dispatch, so a stale timestamp can never leak in from async
+  // continuations; min() guards against skewed event clocks.
+  const now = performance.now();
+  const dispatchingEvent =
+    typeof window === "undefined" ? undefined : window.event;
+  const startedAt =
+    dispatchingEvent && typeof dispatchingEvent.timeStamp === "number"
+      ? Math.min(dispatchingEvent.timeStamp, now)
+      : now;
   activeTrace = {
     channelId,
-    startedAt: performance.now(),
+    startedAt,
     routeCommitAt: null,
     windowFetch: null,
     membersFetch: null,
