@@ -138,10 +138,13 @@ test("settle waits for a delayed lazy channel-pane chunk", async ({ page }) => {
     early.cleanMeasures,
     "no clean settle may be recorded while the pane chunk is suspended",
   ).toBe(0);
+  // Boolean form: a truncated record already landing clears the start mark
+  // and nulls elapsedSinceClick — that too is budget exhaustion, and must
+  // fail with this message rather than a raw matcher error.
   expect(
-    early.elapsedSinceClick,
+    early.elapsedSinceClick !== null && early.elapsedSinceClick < 4_500,
     "harness overhead consumed the tracer's settle deadline — timing, not a tracer bug",
-  ).toBeLessThan(4_500);
+  ).toBe(true);
 
   releaseChunk();
 

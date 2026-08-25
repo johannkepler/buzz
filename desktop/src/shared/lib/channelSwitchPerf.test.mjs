@@ -458,6 +458,23 @@ test("a scheduled route-exit abandon canceled in the same task keeps the trace",
   );
 });
 
+test("beginning a switch revokes a pending route-exit abandon for that channel", async () => {
+  await withSettleHarness(
+    async ({ begin, scheduleAbandon, settle, flush, measures }) => {
+      // Same-task unmount-then-renavigate to the same channel: the cleanup
+      // schedules the abandon, then goChannel synchronously opens a fresh
+      // trace before the microtask drains. The stale abandon must not kill
+      // the new trace.
+      scheduleAbandon("aaaa1111aaaa1111");
+      begin("aaaa1111aaaa1111");
+      await Promise.resolve();
+      settle("aaaa1111aaaa1111");
+      flush();
+      assert.deepEqual(measures(), ["aaaa1111aaaa1111"]);
+    },
+  );
+});
+
 test("an uncanceled route-exit abandon drops the trace before any frame fires", async () => {
   await withSettleHarness(
     async ({ begin, scheduleAbandon, settle, flush, measures }) => {

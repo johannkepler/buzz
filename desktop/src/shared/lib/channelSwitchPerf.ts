@@ -248,6 +248,10 @@ function traceOverlapsHiddenWindow(trace: ChannelSwitchTrace): boolean {
 export function beginChannelSwitchTrace(channelId: string): void {
   if (typeof performance === "undefined") return;
   ensureVisibilityWatcher();
+  // A same-task unmount-then-renavigate to this channel leaves the exit
+  // cleanup's scheduled abandon pending; it must not kill the fresh trace
+  // when its microtask drains.
+  cancelRouteExitAbandon(channelId);
   activeTrace = {
     channelId,
     startedAt: performance.now(),
