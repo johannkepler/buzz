@@ -102,14 +102,24 @@ fn append_line_rotating(path: &std::path::Path, line: &str, max_bytes: u64) -> R
             rotated.push(".1");
             let rotated = std::path::PathBuf::from(rotated);
             // Remove the retained generation before renaming over it: on
-            // Windows, rename does not replace an existing destination, and a
-            // failed rotation here would silently drop every subsequent trace
-            // (the frontend deliberately swallows sink errors). Same platform
-            // rule as managed_agents::storage::start_install_log_session.
-            if rotated.exists() {
-                std::fs::remove_file(&rotated).map_err(|e| e.to_string())?;
+            // Windows, rename does not replace an existing destination. Same
+            // platform rule as managed_agents::storage::start_install_log_session.
+            //
+            // Rotation itself is best-effort: an AV/EDR or editor holding a
+            // transient lock (again, chiefly Windows) would otherwise fail
+            // EVERY append until the lock clears — the frontend deliberately
+            // swallows sink errors, so records would vanish silently.
+            // Degrade to an unrotated append; the size cap re-applies once
+            // rotation succeeds on a later write.
+            let rotation = (|| -> std::io::Result<()> {
+                if rotated.exists() {
+                    std::fs::remove_file(&rotated)?;
+                }
+                std::fs::rename(path, &rotated)
+            })();
+            if let Err(e) = rotation {
+                eprintln!("buzz-desktop: perf-log rotation failed, appending unrotated: {e}");
             }
-            std::fs::rename(path, &rotated).map_err(|e| e.to_string())?;
         }
     }
     let mut file = std::fs::OpenOptions::new()
@@ -312,6 +322,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&rotated).expect("read rotated"),
             "current-full\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_degrades_to_an_unrotated_append() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "perf-log-degrade-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("switch-perf.jsonl");
+        let rotated = dir.join("switch-perf.jsonl.1");
+        std::fs::write(&path, "oversized-live\n").expect("seed live");
+        std::fs::write(&rotated, "old-generation\n").expect("seed rotated");
+
+        // A read-only directory makes remove/rename fail, like a transient
+        // AV/EDR hold would. The append must degrade to the unrotated file —
+        // dropping every record until an external lock clears would violate
+        // the sink's no-silent-loss contract.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("lock dir");
+        let result = append_line_rotating(&path, "must-survive", 8);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("unlock dir");
+        result.expect("append must survive a failed rotation");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read live"),
+            "oversized-live\nmust-survive\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).expect("read rotated"),
+            "old-generation\n"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
