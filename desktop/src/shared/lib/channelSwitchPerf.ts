@@ -161,6 +161,18 @@ export function abandonChannelSwitchTrace(channelId: string): void {
   }
 }
 
+/**
+ * dropActiveChannelSwitchTrace abandons whatever trace is active, regardless
+ * of channel. Called when navigation leaves the channel surface (any
+ * committed non-channel destination, any history traversal): a trace can be
+ * live with no channel screen mounted at all — the route still resolving —
+ * so no route-exit cleanup exists to abandon it, and a later untraced
+ * re-entry within the timeout would settle it with the time spent away.
+ */
+export function dropActiveChannelSwitchTrace(): void {
+  activeTrace = null;
+}
+
 // Route-exit abandons currently deferred; see scheduleRouteExitAbandon.
 const pendingRouteExitAbandons = new Set<string>();
 

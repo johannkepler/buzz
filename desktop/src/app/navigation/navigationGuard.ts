@@ -1,3 +1,5 @@
+import { dropActiveChannelSwitchTrace } from "@/shared/lib/channelSwitchPerf";
+
 export type GuardedNavigation =
   | {
       kind: "history";
@@ -40,6 +42,11 @@ export function traverseHistory(
     return false;
   }
 
+  // History navigation is deliberately untraced and its destination is
+  // unknowable here: a live switch trace must not survive into it, or an
+  // untraced re-entry into the traced channel would settle it with the time
+  // spent away.
+  dropActiveChannelSwitchTrace();
   history[direction]();
   return true;
 }

@@ -326,10 +326,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failed_rotation_degrades_to_an_unrotated_append() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "perf-log-degrade-{}-{:?}",
             std::process::id(),
@@ -339,25 +337,21 @@ mod tests {
         let path = dir.join("switch-perf.jsonl");
         let rotated = dir.join("switch-perf.jsonl.1");
         std::fs::write(&path, "oversized-live\n").expect("seed live");
-        std::fs::write(&rotated, "old-generation\n").expect("seed rotated");
+        // A non-empty DIRECTORY at the rotated path defeats remove_file and
+        // rename on every platform — including for root, where permission
+        // tricks no-op (containers often run tests as uid 0). It stands in
+        // for a transient AV/EDR hold: the append must degrade to the
+        // unrotated file, not drop records until the lock clears.
+        std::fs::create_dir_all(rotated.join("hold")).expect("seed blocker");
 
-        // A read-only directory makes remove/rename fail, like a transient
-        // AV/EDR hold would. The append must degrade to the unrotated file —
-        // dropping every record until an external lock clears would violate
-        // the sink's no-silent-loss contract.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("lock dir");
-        let result = append_line_rotating(&path, "must-survive", 8);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("unlock dir");
-        result.expect("append must survive a failed rotation");
+        append_line_rotating(&path, "must-survive", 8)
+            .expect("append must survive a failed rotation");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("read live"),
             "oversized-live\nmust-survive\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(&rotated).expect("read rotated"),
-            "old-generation\n"
-        );
+        assert!(rotated.join("hold").exists(), "blocker untouched");
         std::fs::remove_dir_all(&dir).ok();
     }
 

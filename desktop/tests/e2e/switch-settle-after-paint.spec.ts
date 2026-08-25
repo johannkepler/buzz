@@ -88,15 +88,30 @@ test("settle waits for a delayed lazy channel-pane chunk", async ({ page }) => {
     .toBe(true);
 
   // Give the tracer ample frames to (incorrectly) settle behind the held
-  // chunk. This wait must stay well under the tracer's 5s settle deadline.
+  // chunk. The tracer's 5s render-wait deadline runs from settle entry
+  // (query readiness — immediate in mock mode), after which it honestly
+  // emits a TRUNCATED measure even while suspended; the contract under test
+  // is that no CLEAN measure appears. Guard the timing assumption
+  // explicitly so a slow CI box fails with the real reason.
   await page.waitForTimeout(1_500);
-  const early = await page.evaluate(
-    (name) => performance.getEntriesByName(name).length,
-    SWITCH_MEASURE,
-  );
+  const early = await page.evaluate((name) => {
+    const start = performance.getEntriesByName("buzz:channel-switch:start")[0];
+    return {
+      cleanMeasures: performance
+        .getEntriesByName(name)
+        .filter(
+          (entry) => !(entry as PerformanceMeasure).detail?.settleWaitTruncated,
+        ).length,
+      elapsedSinceClick: start ? performance.now() - start.startTime : null,
+    };
+  }, SWITCH_MEASURE);
   expect(
-    early,
-    "no settle may be recorded while the pane chunk is suspended",
+    early.elapsedSinceClick,
+    "harness overhead consumed the tracer's settle deadline — timing, not a tracer bug",
+  ).toBeLessThan(4_500);
+  expect(
+    early.cleanMeasures,
+    "no clean settle may be recorded while the pane chunk is suspended",
   ).toBe(0);
 
   releaseChunk();
