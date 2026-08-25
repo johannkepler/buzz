@@ -19,12 +19,6 @@
  * `members=cache` — by design, not omission.
  */
 
-export type ChannelSwitchFetchTrace = {
-  durationMs: number;
-  eventCount?: number;
-  memberCount?: number;
-};
-
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
 export type ChannelSwitchTrace = {
@@ -48,6 +42,7 @@ let activeTrace: ChannelSwitchTrace | null = null;
 export function summarizeChannelSwitchTrace(
   trace: ChannelSwitchTrace,
   settledAt: number,
+  settleWaitTruncated = false,
 ): string {
   const total = Math.round(settledAt - trace.startedAt);
   const commit =
@@ -64,7 +59,8 @@ export function summarizeChannelSwitchTrace(
       : `${trace.membersFetch.memberCount} members in ${Math.round(trace.membersFetch.durationMs)}ms`;
   return (
     `[switch-perf] channel=${trace.channelId.slice(0, 8)} total=${total}ms ` +
-    `commit=${commit} window=${window} members=${members}`
+    `commit=${commit} window=${window} members=${members}` +
+    (settleWaitTruncated ? " settle=truncated" : "")
   );
 }
 
@@ -76,6 +72,7 @@ export function summarizeChannelSwitchTrace(
 export function buildSwitchPerfLogRecord(
   trace: ChannelSwitchTrace,
   settledAt: number,
+  settleWaitTruncated = false,
 ): {
   ts: string;
   channelId: string;
@@ -83,8 +80,10 @@ export function buildSwitchPerfLogRecord(
   commitOffsetMs: number | null;
   windowFetch: { durationMs: number; eventCount: number } | null;
   membersFetch: { durationMs: number; memberCount: number } | null;
+  settleWaitTruncated?: true;
 } {
   return {
+    ...(settleWaitTruncated ? { settleWaitTruncated: true as const } : {}),
     ts: new Date().toISOString(),
     channelId: trace.channelId,
     totalMs: Math.round(settledAt - trace.startedAt),
@@ -259,6 +258,23 @@ export function resetChannelSwitchTrace(): void {
 const SETTLE_RENDER_WAIT_MS = 5_000;
 
 /**
+ * Per-frame decision for the bounded settle wait: keep waiting only while
+ * the deferred render is still pending AND the deadline hasn't passed. When
+ * the wait ends with the render still pending, the record must say so — the
+ * >deadline tail is exactly what this tracer exists to expose, so the
+ * measurement is kept but flagged rather than posing as an honest settled
+ * paint. Pure for unit testing.
+ */
+export function resolveSettleWait(
+  now: number,
+  waitDeadline: number,
+  renderPending: boolean,
+): "wait" | { settleWaitTruncated: boolean } {
+  if (renderPending && now < waitDeadline) return "wait";
+  return { settleWaitTruncated: renderPending };
+}
+
+/**
  * Closes the active trace once the settled frame has painted. The timeline
  * renders rows through a deferred snapshot that exposes
  * `data-render-pending` until the low-priority commit catches up, and the
@@ -287,7 +303,7 @@ export function settleChannelSwitchTrace(channelId: string): void {
   // finish inside the measured window still attribute to it. It is released
   // when the record lands; a newer switch's begin() simply replaces it.
   const waitDeadline = performance.now() + SETTLE_RENDER_WAIT_MS;
-  const record = () => {
+  const record = (settleWaitTruncated: boolean) => {
     const settledAt = performance.now();
     if (activeTrace === trace) activeTrace = null;
     performance.mark(CHANNEL_SWITCH_SETTLED_MARK, {
@@ -299,12 +315,17 @@ export function settleChannelSwitchTrace(channelId: string): void {
         routeCommitAt: trace.routeCommitAt,
         windowFetch: trace.windowFetch,
         membersFetch: trace.membersFetch,
+        ...(settleWaitTruncated ? { settleWaitTruncated: true } : {}),
       },
       start: trace.startedAt,
       end: settledAt,
     });
-    console.info(summarizeChannelSwitchTrace(trace, settledAt));
-    appendSwitchPerfLogRecord(buildSwitchPerfLogRecord(trace, settledAt));
+    console.info(
+      summarizeChannelSwitchTrace(trace, settledAt, settleWaitTruncated),
+    );
+    appendSwitchPerfLogRecord(
+      buildSwitchPerfLogRecord(trace, settledAt, settleWaitTruncated),
+    );
   };
   const awaitDeferredCommit = () => {
     if (activeTrace !== trace) {
@@ -315,16 +336,18 @@ export function settleChannelSwitchTrace(channelId: string): void {
       // to diagnose. Better no measurement than a fabricated one.
       return;
     }
-    if (
-      performance.now() < waitDeadline &&
-      document.querySelector('[data-render-pending="true"]') !== null
-    ) {
+    const decision = resolveSettleWait(
+      performance.now(),
+      waitDeadline,
+      document.querySelector('[data-render-pending="true"]') !== null,
+    );
+    if (decision === "wait") {
       window.requestAnimationFrame(awaitDeferredCommit);
       return;
     }
     window.requestAnimationFrame(() => {
       if (activeTrace !== trace) return;
-      record();
+      record(decision.settleWaitTruncated);
     });
   };
   window.requestAnimationFrame(awaitDeferredCommit);

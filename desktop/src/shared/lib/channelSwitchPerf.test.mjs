@@ -5,6 +5,7 @@ import {
   shouldAttributeFetch,
   buildSwitchPerfLogRecord,
   resolveSettleAction,
+  resolveSettleWait,
   summarizeChannelSwitchTrace,
 } from "./channelSwitchPerf.ts";
 
@@ -101,6 +102,32 @@ test("settle drops a trace that has timed out", () => {
   assert.deepEqual(
     resolveSettleAction(stale, "abcdef1234567890", 11_000).settledTrace,
     stale,
+  );
+});
+
+test("the settle wait records truncated — never as an honest settle — at deadline", () => {
+  // Still pending, before the deadline: keep waiting.
+  assert.equal(resolveSettleWait(4_999, 5_000, true), "wait");
+  // Render caught up: record cleanly.
+  assert.deepEqual(resolveSettleWait(1_000, 5_000, false), {
+    settleWaitTruncated: false,
+  });
+  // Deadline expired while still pending: the record must say so — a >5s
+  // switch reported as an ordinary settle would hide exactly the tail this
+  // tracer exists to expose.
+  assert.deepEqual(resolveSettleWait(5_000, 5_000, true), {
+    settleWaitTruncated: true,
+  });
+});
+
+test("a truncated settle is flagged in the summary and the log record", () => {
+  const summary = summarizeChannelSwitchTrace(trace(), 1_412, true);
+  assert.ok(summary.endsWith(" settle=truncated"), summary);
+  const record = buildSwitchPerfLogRecord(trace(), 1_412, true);
+  assert.equal(record.settleWaitTruncated, true);
+  // Clean settles keep the field out of the line entirely.
+  assert.ok(
+    !("settleWaitTruncated" in buildSwitchPerfLogRecord(trace(), 1_412)),
   );
 });
 

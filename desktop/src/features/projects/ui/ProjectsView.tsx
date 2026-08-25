@@ -182,6 +182,15 @@ export function ProjectsView() {
     snapshotProjects,
     activeCommunity?.reposDir,
   );
+  // Hydration marker for the switch-perf harness: the shell commits long
+  // before the query fan loads. isLoading so disabled queries never wedge it.
+  const projectsHydrating =
+    projectsQuery.isLoading ||
+    projectsWorkItemsQuery.isLoading ||
+    repoSnapshotsQuery.isLoading ||
+    activitySummariesQuery.isLoading ||
+    repositoryActivitySummariesQuery.isLoading ||
+    localRepositoriesQuery.isLoading;
   const memberChannelIds = useMemberChannelIds();
   const repositoryUnavailableReasonFor = useRepositoryUnavailableReasonFor(
     repoSnapshotsQuery.data?.unavailable,
@@ -736,6 +745,7 @@ export function ProjectsView() {
         data-project-context-detached={
           isNarrowProjectsLayout ? undefined : "true"
         }
+        data-projects-hydrating={projectsHydrating ? "true" : undefined}
         data-testid="projects-overview-layout"
       >
         <ProjectsWorkspaceChrome

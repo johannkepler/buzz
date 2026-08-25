@@ -75,8 +75,9 @@ fn shape_perf_log_line(
     }
     let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
     // The cap must hold for what actually reaches the disk: gitSha and label
-    // are folded in after the record-size check above.
-    if line.len() > MAX_RECORD_BYTES {
+    // are folded in after the record-size check above, and writeln! appends
+    // a newline terminator — reserve one byte for it.
+    if line.len() + 1 > MAX_RECORD_BYTES {
         return Err("perf log line too large".to_string());
     }
     Ok(line)
@@ -215,6 +216,37 @@ mod tests {
         let record = format!(r#"{{"pad":"{pad}"}}"#);
         assert!(record.len() <= MAX_RECORD_BYTES);
         assert!(shape_perf_log_line(&record, Some(&"s".repeat(64)), None).is_err());
+    }
+
+    #[test]
+    fn the_cap_bounds_bytes_on_disk_including_the_newline() {
+        // Shaped line = {"pad":"…","gitSha":null} → pad length + 24 bytes.
+        // The largest accepted line is MAX_RECORD_BYTES - 1: writeln! appends
+        // a newline, and the cap bounds what reaches the disk.
+        let fits = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RECORD_BYTES - 25));
+        let line = shape_perf_log_line(&fits, None, None).expect("one byte reserved for newline");
+        assert_eq!(line.len(), MAX_RECORD_BYTES - 1);
+
+        let dir = std::env::temp_dir().join(format!(
+            "perf-log-newline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("switch-perf.jsonl");
+        let _ = std::fs::remove_file(&path);
+        append_line_rotating(&path, &line, MAX_LOG_BYTES).expect("append");
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            MAX_RECORD_BYTES as u64,
+            "on-disk record must not exceed the cap"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // One pad byte more serializes to exactly MAX_RECORD_BYTES, which
+        // would write MAX_RECORD_BYTES + 1 bytes — rejected.
+        let over = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RECORD_BYTES - 24));
+        assert!(shape_perf_log_line(&over, None, None).is_err());
     }
 
     #[test]

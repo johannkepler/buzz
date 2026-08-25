@@ -21,13 +21,20 @@ import { installMockBridge } from "../helpers/bridge";
  *                         (project enumeration, work items, repo snapshots,
  *                         activity summaries) on top of the shell, so this
  *                         axis captures the cross-surface switch the felt
- *                         1-2s report singled out.
+ *                         1-2s report singled out. Readiness gates on the
+ *                         surface's data-projects-hydrating marker, not just
+ *                         the shell header — a sample whose query fan is
+ *                         still loading must not count as settled. After the
+ *                         untimed warmup both surfaces are cache-warm, so
+ *                         measured samples are warm-switch commits.
  *
  * Method mirrors warm-switch-markdown.perf.ts: in-page click + rAF polling
  * (CDP latency never pollutes samples), longtask capture per switch, 4x CPU
  * throttle, medians over repeated switches, untimed warmup round-trip first.
  * `deep-history` is pinned to 150 rows so the message-mount cost is fixed
- * and comparable across member counts.
+ * and comparable across member counts. Each direction of a round-trip is
+ * reported as its own median — the two legs mount different surfaces, and a
+ * combined median could represent neither and hide a one-leg regression.
  *
  * Run it (from desktop/):
  *   pnpm build:e2e
@@ -42,6 +49,11 @@ const MEASURED_SWITCHES = 8;
 const THROTTLE_RATE = 4;
 const DEEP_HISTORY_ROWS = 150;
 const MEMBER_COUNTS = [0, 2_000, 10_000] as const;
+/** general + deep-history — the two channels inflateChannelMembers targets. */
+const INFLATED_CHANNEL_IDS = [
+  "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
+  "feedf00d-0000-4000-8000-000000000007",
+];
 
 type SwitchSample = {
   ms: number;
@@ -69,6 +81,8 @@ async function measureSwitch(
     targetTitle: string | null;
     /** Selector that must be present before the switch counts. */
     readySelector: string;
+    /** Selector that must be ABSENT before the switch counts. */
+    pendingSelector: string | null;
   },
 ): Promise<SwitchSample> {
   return page.evaluate(async (args) => {
@@ -92,6 +106,8 @@ async function measureSwitch(
         const ready =
           titleReady &&
           document.querySelector(args.readySelector) !== null &&
+          (args.pendingSelector === null ||
+            document.querySelector(args.pendingSelector) === null) &&
           document.querySelector('[data-render-pending="true"]') === null;
         if (ready) {
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
@@ -121,18 +137,23 @@ type SwitchTarget = {
   targetTestId: string;
   targetTitle: string | null;
   readySelector: string;
+  pendingSelector: string | null;
 };
 
 const GENERAL_TARGET: SwitchTarget = {
   targetTestId: "channel-general",
   targetTitle: "general",
-  readySelector: "[data-message-id]",
+  // Prefixed so the previous channel's still-mounted rows can never satisfy
+  // the gate.
+  readySelector: '[data-message-id^="mock-general-"]',
+  pendingSelector: null,
 };
 
 const DEEP_HISTORY_TARGET: SwitchTarget = {
   targetTestId: "channel-deep-history",
   targetTitle: "deep-history",
   readySelector: '[data-message-id^="mock-deep-history-"]',
+  pendingSelector: null,
 };
 
 const PROJECTS_TARGET: SwitchTarget = {
@@ -140,25 +161,12 @@ const PROJECTS_TARGET: SwitchTarget = {
   targetTitle: null,
   // Rendered by every Projects view mode (Activity intro or section header).
   readySelector: '[data-testid="projects-page-header"]',
+  // The header is shell — the query fan (projects, work items, repo
+  // snapshots, activity summaries) must have settled too.
+  pendingSelector: '[data-projects-hydrating="true"]',
 };
 
-async function runScenario(
-  page: import("@playwright/test").Page,
-  label: string,
-  target: SwitchTarget,
-  back: SwitchTarget,
-): Promise<SwitchSample[]> {
-  // Untimed warmup round-trip: caches both surfaces' queries and jits the
-  // switch code paths.
-  await measureSwitch(page, target);
-  await measureSwitch(page, back);
-
-  const samples: SwitchSample[] = [];
-  for (let run = 0; run < MEASURED_SWITCHES; run += 1) {
-    samples.push(await measureSwitch(page, target));
-    samples.push(await measureSwitch(page, back));
-  }
-
+function reportDirection(label: string, samples: SwitchSample[]): void {
   const times = samples.map((sample) => sample.ms);
   const longtaskTotals = samples.map((sample) => sample.longtaskTotal);
   /* eslint-disable no-console */
@@ -178,7 +186,37 @@ async function runScenario(
     `worst single longtask:   ${Math.max(...samples.map((sample) => sample.longtaskMax)).toFixed(1)}ms`,
   );
   /* eslint-enable no-console */
-  return samples;
+}
+
+async function runScenario(
+  page: import("@playwright/test").Page,
+  label: string,
+  target: SwitchTarget,
+  back: SwitchTarget,
+): Promise<{ toTarget: SwitchSample[]; toBack: SwitchSample[] }> {
+  // Untimed warmup round-trip: caches both surfaces' queries and jits the
+  // switch code paths.
+  await measureSwitch(page, target);
+  await measureSwitch(page, back);
+
+  // The two legs mount different surfaces; report each as its own median so
+  // a one-leg regression can never hide in a combined number.
+  const toTarget: SwitchSample[] = [];
+  const toBack: SwitchSample[] = [];
+  for (let run = 0; run < MEASURED_SWITCHES; run += 1) {
+    toTarget.push(await measureSwitch(page, target));
+    toBack.push(await measureSwitch(page, back));
+  }
+
+  reportDirection(
+    `${label}, ${back.targetTestId} -> ${target.targetTestId}`,
+    toTarget,
+  );
+  reportDirection(
+    `${label}, ${target.targetTestId} -> ${back.targetTestId}`,
+    toBack,
+  );
+  return { toTarget, toBack };
 }
 
 for (const memberCount of MEMBER_COUNTS) {
@@ -234,11 +272,13 @@ for (const memberCount of MEMBER_COUNTS) {
         ),
     );
 
-    // Verify the inflation actually landed before measuring anything.
+    // Verify the inflation actually landed — on BOTH inflated channels. The
+    // bridge silently skips unknown channel names, so a rename/typo would
+    // otherwise run baseline membership under a "10,000 members" label.
     if (memberCount > 0) {
       await expect
         .poll(() =>
-          page.evaluate(async () => {
+          page.evaluate(async (channelIds) => {
             const invoke = (
               window as unknown as {
                 __TAURI_INTERNALS__: {
@@ -249,11 +289,16 @@ for (const memberCount of MEMBER_COUNTS) {
                 };
               }
             ).__TAURI_INTERNALS__.invoke;
-            const response = await invoke("get_channel_members", {
-              channelId: "feedf00d-0000-4000-8000-000000000007",
-            });
-            return response.members.length;
-          }),
+            const counts = await Promise.all(
+              channelIds.map(async (channelId) => {
+                const response = await invoke("get_channel_members", {
+                  channelId,
+                });
+                return response.members.length;
+              }),
+            );
+            return Math.min(...counts);
+          }, INFLATED_CHANNEL_IDS),
         )
         .toBeGreaterThanOrEqual(memberCount);
     }
@@ -282,9 +327,14 @@ for (const memberCount of MEMBER_COUNTS) {
     await client.send("Emulation.setCPUThrottlingRate", { rate: 1 });
 
     // Instrument, not a gate: assert the harness measured real work.
-    expect(channelSamples.length).toBe(MEASURED_SWITCHES * 2);
-    expect(channelSamples.every((sample) => sample.ms > 0)).toBe(true);
-    expect(projectsSamples.length).toBe(MEASURED_SWITCHES * 2);
-    expect(projectsSamples.every((sample) => sample.ms > 0)).toBe(true);
+    for (const samples of [
+      channelSamples.toTarget,
+      channelSamples.toBack,
+      projectsSamples.toTarget,
+      projectsSamples.toBack,
+    ]) {
+      expect(samples.length).toBe(MEASURED_SWITCHES);
+      expect(samples.every((sample) => sample.ms > 0)).toBe(true);
+    }
   });
 }
