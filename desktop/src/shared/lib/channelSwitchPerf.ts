@@ -280,7 +280,13 @@ export function beginChannelSwitchTrace(channelId: string): void {
   performance.clearMarks(CHANNEL_SWITCH_START_MARK);
   performance.clearMarks(CHANNEL_SWITCH_SETTLED_MARK);
   performance.clearMeasures(CHANNEL_SWITCH_MEASURE);
-  performance.mark(CHANNEL_SWITCH_START_MARK, { detail: { channelId } });
+  // startTime keeps the mark on the same anchor as the measure — without it
+  // the Performance panel would show the measure starting before its own
+  // start mark by the input delay.
+  performance.mark(CHANNEL_SWITCH_START_MARK, {
+    detail: { channelId },
+    startTime: startedAt,
+  });
 }
 
 export function markChannelSwitchRouteCommit(channelId: string): void {

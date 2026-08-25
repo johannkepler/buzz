@@ -471,6 +471,9 @@ test("the trace anchors at the input event, not handler dispatch", async () => {
     globalThis.window.event = { timeStamp: performance.now() - 550 };
     begin("aaaa1111aaaa1111");
     delete globalThis.window.event;
+    const startMark = performance
+      .getEntriesByName("buzz:channel-switch:start")
+      .at(-1);
     settle("aaaa1111aaaa1111");
     flush();
     const measure = performance
@@ -481,6 +484,9 @@ test("the trace anchors at the input event, not handler dispatch", async () => {
       measure.duration >= 550,
       `input delay must be inside the measure (got ${measure.duration})`,
     );
+    // The mark and the measure must share the anchor, or the Performance
+    // panel shows two different switch durations for the same switch.
+    assert.equal(startMark?.startTime, measure.startTime);
   });
 });
 
