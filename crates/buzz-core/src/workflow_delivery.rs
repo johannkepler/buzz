@@ -46,21 +46,21 @@ impl fmt::Display for WorkflowDeliveryId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowDeliveryBinding {
     /// Server-resolved community that owns the delivery.
-    pub community_id: CommunityId,
+    community_id: CommunityId,
     /// Workflow definition selected for the run.
-    pub workflow_id: Uuid,
+    workflow_id: Uuid,
     /// Durable workflow run.
-    pub run_id: Uuid,
+    run_id: Uuid,
     /// Stable, non-empty workflow step identifier.
-    pub step_id: String,
+    step_id: String,
     /// Managed agent allowed to claim the delivery.
-    pub target_pubkey: PublicKey,
+    target_pubkey: PublicKey,
     /// Exact owner-signed kind-30620 definition revision.
-    pub definition_event_id: EventId,
+    definition_event_id: EventId,
     /// Visible kind-9 message created for this delivery.
-    pub message_event_id: EventId,
+    message_event_id: EventId,
     /// Canonical identity of the authority that caused this run.
-    pub cause: WorkflowDeliveryCause,
+    cause: WorkflowDeliveryCause,
 }
 
 impl WorkflowDeliveryBinding {
@@ -90,6 +90,39 @@ impl WorkflowDeliveryBinding {
             message_event_id,
             cause,
         })
+    }
+
+    /// Return the server-resolved community identity.
+    pub const fn community_id(&self) -> CommunityId {
+        self.community_id
+    }
+    /// Return the workflow identity.
+    pub const fn workflow_id(&self) -> Uuid {
+        self.workflow_id
+    }
+    /// Return the durable run identity.
+    pub const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    /// Return the validated workflow step identity.
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+    /// Return the managed-agent target identity.
+    pub const fn target_pubkey(&self) -> PublicKey {
+        self.target_pubkey
+    }
+    /// Return the exact signed workflow-definition revision.
+    pub const fn definition_event_id(&self) -> EventId {
+        self.definition_event_id
+    }
+    /// Return the visible message event identity.
+    pub const fn message_event_id(&self) -> EventId {
+        self.message_event_id
+    }
+    /// Return the immutable trigger authority identity.
+    pub fn cause(&self) -> &WorkflowDeliveryCause {
+        &self.cause
     }
 
     /// Validate the visible message against this binding's `message-v1` admission rule.
@@ -172,9 +205,9 @@ pub fn message_v1_targets(event: &Event) -> Result<Vec<PublicKey>, WorkflowDeliv
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowDeliveryWake {
     /// Managed-agent recipient of this hint.
-    pub target_pubkey: PublicKey,
+    target_pubkey: PublicKey,
     /// Identifier of the durable delivery to look up.
-    pub delivery_id: WorkflowDeliveryId,
+    delivery_id: WorkflowDeliveryId,
 }
 
 impl WorkflowDeliveryWake {
@@ -184,6 +217,16 @@ impl WorkflowDeliveryWake {
             target_pubkey,
             delivery_id,
         }
+    }
+
+    /// Return the managed-agent recipient of this hint.
+    pub const fn target_pubkey(&self) -> PublicKey {
+        self.target_pubkey
+    }
+
+    /// Return the durable delivery identifier to look up.
+    pub const fn delivery_id(&self) -> WorkflowDeliveryId {
+        self.delivery_id
     }
 
     /// Build the unsigned, identifier-only kind-24620 wake event.
@@ -315,18 +358,18 @@ mod tests {
     #[test]
     fn binding_owns_all_identity_fields_and_rejects_blank_step() {
         let binding = binding();
-        assert_eq!(binding.step_id, "notify");
-        assert!(matches!(binding.cause, WorkflowDeliveryCause::Event(_)));
+        assert_eq!(binding.step_id(), "notify");
+        assert!(matches!(binding.cause(), WorkflowDeliveryCause::Event(_)));
         assert_eq!(
             WorkflowDeliveryBinding::new(
-                binding.community_id,
-                binding.workflow_id,
-                binding.run_id,
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
                 " \t",
-                binding.target_pubkey,
-                binding.definition_event_id,
-                binding.message_event_id,
-                binding.cause.clone(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
             ),
             Err(WorkflowDeliveryError::EmptyStepId)
         );
@@ -340,7 +383,7 @@ mod tests {
             tag.as_slice(),
             [
                 "p",
-                &binding.target_pubkey.to_hex(),
+                &binding.target_pubkey().to_hex(),
                 "",
                 WORKFLOW_DELIVERY_TARGET_MARKER
             ]
@@ -348,24 +391,120 @@ mod tests {
     }
 
     #[test]
-    fn cause_variants_and_each_identity_field_affect_equality() {
+    fn every_binding_identity_field_affects_equality() {
         let binding = binding();
-        let event = WorkflowDeliveryCause::Event(EventId::from_hex(&"44".repeat(32)).unwrap());
-        let schedule = WorkflowDeliveryCause::Schedule {
-            scheduled_for_unix_seconds: 1,
-        };
-        let later_schedule = WorkflowDeliveryCause::Schedule {
-            scheduled_for_unix_seconds: 2,
-        };
-        let webhook = WorkflowDeliveryCause::Webhook {
-            invocation_id: Uuid::new_v4(),
-        };
-        let other_webhook = WorkflowDeliveryCause::Webhook {
-            invocation_id: Uuid::new_v4(),
-        };
-        assert_ne!(binding.cause, event);
-        assert_ne!(schedule, later_schedule);
-        assert_ne!(webhook, other_webhook);
+        let different_target = Keys::generate().public_key();
+        let variants = [
+            WorkflowDeliveryBinding::new(
+                CommunityId::from_uuid(Uuid::new_v4()),
+                binding.workflow_id(),
+                binding.run_id(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                Uuid::new_v4(),
+                binding.run_id(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                Uuid::new_v4(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
+                "other_step",
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
+                binding.step_id(),
+                different_target,
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                EventId::from_hex(&"44".repeat(32)).unwrap(),
+                binding.message_event_id(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                EventId::from_hex(&"55".repeat(32)).unwrap(),
+                binding.cause().clone(),
+            )
+            .unwrap(),
+            WorkflowDeliveryBinding::new(
+                binding.community_id(),
+                binding.workflow_id(),
+                binding.run_id(),
+                binding.step_id(),
+                binding.target_pubkey(),
+                binding.definition_event_id(),
+                binding.message_event_id(),
+                WorkflowDeliveryCause::Schedule {
+                    scheduled_for_unix_seconds: 1,
+                },
+            )
+            .unwrap(),
+        ];
+        for variant in variants {
+            assert_ne!(binding, variant);
+        }
+        assert_ne!(
+            WorkflowDeliveryCause::Schedule {
+                scheduled_for_unix_seconds: 1
+            },
+            WorkflowDeliveryCause::Schedule {
+                scheduled_for_unix_seconds: 2
+            }
+        );
+        assert_ne!(
+            WorkflowDeliveryCause::Webhook {
+                invocation_id: Uuid::new_v4()
+            },
+            WorkflowDeliveryCause::Webhook {
+                invocation_id: Uuid::new_v4()
+            }
+        );
     }
 
     #[test]
@@ -376,26 +515,26 @@ mod tests {
             .sign_with_keys(&Keys::generate())
             .unwrap();
         let matching = WorkflowDeliveryBinding::new(
-            binding.community_id,
-            binding.workflow_id,
-            binding.run_id,
-            binding.step_id.clone(),
-            binding.target_pubkey,
-            binding.definition_event_id,
+            binding.community_id(),
+            binding.workflow_id(),
+            binding.run_id(),
+            binding.step_id().to_owned(),
+            binding.target_pubkey(),
+            binding.definition_event_id(),
             event.id,
-            binding.cause.clone(),
+            binding.cause().clone(),
         )
         .unwrap();
         assert_eq!(
             message_v1_targets(&event).unwrap(),
-            vec![binding.target_pubkey]
+            vec![binding.target_pubkey()]
         );
         assert!(matching.validate_message_event(&event).is_ok());
 
         let malformed = EventBuilder::new(Kind::Custom(9), "visible")
             .tags([parse_tag([
                 "p",
-                &binding.target_pubkey.to_hex(),
+                &binding.target_pubkey().to_hex(),
                 "",
                 WORKFLOW_DELIVERY_TARGET_MARKER,
                 "extra",
@@ -406,6 +545,101 @@ mod tests {
         assert_eq!(
             message_v1_targets(&malformed),
             Err(WorkflowDeliveryError::InvalidMessageV1Tag)
+        );
+    }
+
+    #[test]
+    fn binding_and_wake_parsers_reject_all_critical_mismatches() {
+        let binding = binding();
+        let wrong_kind = EventBuilder::new(Kind::Custom(1), "")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(
+            binding.validate_message_event(&wrong_kind),
+            Err(WorkflowDeliveryError::WrongMessageKind(1))
+        );
+
+        let missing_target_event = EventBuilder::new(Kind::Custom(9), "")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let missing_target = WorkflowDeliveryBinding::new(
+            binding.community_id(),
+            binding.workflow_id(),
+            binding.run_id(),
+            binding.step_id(),
+            binding.target_pubkey(),
+            binding.definition_event_id(),
+            missing_target_event.id,
+            binding.cause().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_target.validate_message_event(&missing_target_event),
+            Err(WorkflowDeliveryError::MissingMessageV1Target)
+        );
+
+        let mismatch = EventBuilder::new(Kind::Custom(9), "")
+            .tags([binding.message_v1_target_tag().unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(
+            binding.validate_message_event(&mismatch),
+            Err(WorkflowDeliveryError::MessageEventIdMismatch)
+        );
+
+        let duplicate = EventBuilder::new(Kind::Custom(9), "")
+            .tags([
+                binding.message_v1_target_tag().unwrap(),
+                binding.message_v1_target_tag().unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(
+            message_v1_targets(&duplicate),
+            Err(WorkflowDeliveryError::DuplicateMessageV1Target)
+        );
+
+        let invalid_public_key = EventBuilder::new(Kind::Custom(9), "")
+            .tags([
+                parse_tag(["p", "not-a-public-key", "", WORKFLOW_DELIVERY_TARGET_MARKER]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(
+            message_v1_targets(&invalid_public_key),
+            Err(WorkflowDeliveryError::InvalidPublicKey)
+        );
+
+        let target = binding.target_pubkey().to_hex();
+        let id = Uuid::new_v4().to_string();
+        for tags in [
+            vec![parse_tag(["p", &target]).unwrap()],
+            vec![
+                parse_tag(["p", &target]).unwrap(),
+                parse_tag(["p", &target]).unwrap(),
+                parse_tag(["delivery", &id]).unwrap(),
+            ],
+        ] {
+            let wake = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_AGENT_WAKE as u16), "")
+                .tags(tags)
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            assert!(WorkflowDeliveryWake::parse(&wake).is_err());
+        }
+        let invalid = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_AGENT_WAKE as u16), "")
+            .tags([
+                parse_tag(["p", &target]).unwrap(),
+                parse_tag(["delivery", "not-a-uuid"]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(
+            WorkflowDeliveryWake::parse(&invalid),
+            Err(WorkflowDeliveryError::InvalidDeliveryId)
+        );
+        assert_eq!(
+            WorkflowDeliveryWake::parse(&wrong_kind),
+            Err(WorkflowDeliveryError::WrongWakeKind(1))
         );
     }
 
