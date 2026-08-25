@@ -248,6 +248,27 @@ test("an undisturbed settle records exactly one measure", async () => {
   });
 });
 
+test("abandoned switches never accumulate start marks", async () => {
+  await withSettleHarness(async ({ abandon, begin }) => {
+    const { CHANNEL_SWITCH_START_MARK } = await import(
+      "./channelSwitchPerf.ts"
+    );
+    performance.clearMarks?.(CHANNEL_SWITCH_START_MARK);
+    // Traces that die without recording (forum visits, route exits, drops)
+    // never reach record()'s buffer clearing — begin() must bound the
+    // buffer itself or weeks-long sessions accumulate a mark per abandon.
+    for (const channelId of ["aaaa", "bbbb", "cccc", "dddd"]) {
+      begin(channelId);
+      abandon(channelId);
+    }
+    assert.equal(
+      performance.getEntriesByName(CHANNEL_SWITCH_START_MARK).length,
+      1,
+    );
+    performance.clearMarks?.(CHANNEL_SWITCH_START_MARK);
+  });
+});
+
 test("a settle in a hidden window drops the trace instead of recording", async () => {
   await withSettleHarness(
     async ({ begin, settle, flush, measures }) => {

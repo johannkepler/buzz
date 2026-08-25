@@ -201,6 +201,12 @@ export function beginChannelSwitchTrace(channelId: string): void {
     windowFetch: null,
     membersFetch: null,
   };
+  // Clear the previous start mark here, not only in record(): traces that
+  // die without recording (forum visits, route exits, drops) never reach
+  // record()'s buffer clearing, and weeks-long sessions would accumulate a
+  // stray mark per abandon. Clearing at begin bounds the buffer to one
+  // start mark no matter how the previous trace ended.
+  performance.clearMarks(CHANNEL_SWITCH_START_MARK);
   performance.mark(CHANNEL_SWITCH_START_MARK, { detail: { channelId } });
 }
 
