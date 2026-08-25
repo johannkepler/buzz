@@ -54,8 +54,10 @@ export function useAppNavigation() {
         hasStateUpdate: next.state !== undefined,
         // Leaving the channel surface must drop any active switch trace —
         // including one whose channel screen never mounted (route still
-        // resolving), which no component cleanup can cover.
-        leavesChannelSurface: !next.to.startsWith("/channels/"),
+        // resolving), which no component cleanup can cover. Only the exact
+        // channel message-view route keeps a live trace: sibling routes
+        // (forum posts) mount different, untraced screens.
+        leavesChannelSurface: next.to !== "/channels/$channelId",
         navigate: () =>
           navigate({
             ...next,
