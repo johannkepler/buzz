@@ -33,7 +33,7 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git remote add upstream https://github.com/block/buzz.git
           git fetch upstream main
-          git checkout main
+          git checkout -B main origin/main
           git merge --ff-only upstream/main   # fails loudly if main was dirtied
           git push origin main
 
@@ -41,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git checkout lab
+          git checkout -B lab origin/lab
           if git merge-base --is-ancestor main lab; then
             echo "lab already contains upstream main — nothing to do"
             exit 0
