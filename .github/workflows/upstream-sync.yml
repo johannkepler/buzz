@@ -37,7 +37,10 @@ jobs:
           git merge --ff-only upstream/main   # fails loudly if main was dirtied
           git push origin main
 
-      - name: Propose merge into lab
+      # No PR: GitHub blocks Actions-token PR creation in forks, and the real
+      # change gate is downstream anyway (homelab pins image tags). Clean
+      # merges land on lab directly; conflicts become an issue for a human.
+      - name: Merge main into lab
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,17 +49,12 @@ jobs:
             echo "lab already contains upstream main — nothing to do"
             exit 0
           fi
-          BRANCH="sync/upstream-$(date +%Y%m%d)"
-          git checkout -b "$BRANCH"
           if git merge --no-edit main; then
-            git push origin "$BRANCH"
-            gh pr create --base lab --head "$BRANCH" \
-              --title "Sync: upstream $(date +%Y-%m-%d)" \
-              --body "Automated merge of upstream (via \`main\`) into \`lab\`. Clean merge — review the diff, check CI, merge."
+            git push origin lab
           else
             FILES=$(git diff --name-only --diff-filter=U)
             git merge --abort
             gh issue create \
               --title "Sync conflict with upstream $(date +%Y-%m-%d)" \
-              --body "$(printf 'Merging `main` into `lab` conflicts in:\n\n```\n%s\n```\n\nResolve locally: `git checkout -b %s lab && git merge main`, fix, push, PR to `lab`.' "$FILES" "$BRANCH")"
+              --body "$(printf 'Merging `main` into `lab` conflicts in:\n\n```\n%s\n```\n\nResolve locally on a branch from lab, merge main, fix, push.' "$FILES")"
           fi
