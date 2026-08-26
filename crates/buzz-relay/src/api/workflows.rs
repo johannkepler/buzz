@@ -823,7 +823,484 @@ fn approval_json(approval: &buzz_db::workflow::ApprovalRecord) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Request},
+    };
+    use base64::Engine;
+    use buzz_core::workflow_delivery::WorkflowDeliveryBinding;
+    use buzz_db::{
+        channel::{ChannelType, ChannelVisibility},
+        workflow::WorkflowAgentDelivery,
+    };
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use sha2::{Digest, Sha256};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use crate::{router::build_router, state::AppState};
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+
+    struct AlwaysFreshReplayGuard;
+
+    impl buzz_auth::Nip98ReplayGuard for AlwaysFreshReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct DeliveryRouteFixture {
+        state: Arc<AppState>,
+        pool: PgPool,
+        host: String,
+        community: buzz_core::CommunityId,
+        target: Keys,
+        other_target: Keys,
+        binding: WorkflowDeliveryBinding,
+        delivery_id: WorkflowDeliveryId,
+    }
+
+    fn nip98_auth_header(keys: &Keys, url: &str, body: &[u8]) -> String {
+        let hash: [u8; 32] = Sha256::digest(body).into();
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", "POST"]).expect("method tag"),
+            Tag::parse(["payload", hex::encode(hash).as_str()]).expect("payload tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&event).expect("serialize NIP-98 event"));
+        format!("Nostr {encoded}")
+    }
+
+    async fn post_delivery_json(
+        fixture: &DeliveryRouteFixture,
+        keys: &Keys,
+        path: &str,
+        body: Value,
+    ) -> axum::response::Response {
+        let body = body.to_string();
+        let url = format!("https://{}{path}", fixture.host);
+        let auth = nip98_auth_header(keys, &url, body.as_bytes());
+        build_router(Arc::clone(&fixture.state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, &fixture.host)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&body).expect("response JSON")
+    }
+
+    fn binding_json(binding: &WorkflowDeliveryBinding) -> Value {
+        let cause = match binding.cause() {
+            WorkflowDeliveryCause::Event(event_id) => {
+                serde_json::json!({"kind": "event", "event_id": event_id.to_hex()})
+            }
+            WorkflowDeliveryCause::Schedule {
+                scheduled_for_unix_seconds,
+            } => serde_json::json!({
+                "kind": "schedule",
+                "scheduled_for_unix_seconds": scheduled_for_unix_seconds,
+            }),
+            WorkflowDeliveryCause::Webhook { invocation_id } => {
+                serde_json::json!({"kind": "webhook", "invocation_id": invocation_id})
+            }
+        };
+        serde_json::json!({
+            "community_id": binding.community_id().as_uuid(),
+            "workflow_id": binding.workflow_id(),
+            "run_id": binding.run_id(),
+            "step_id": binding.step_id(),
+            "target_pubkey": binding.target_pubkey().to_hex(),
+            "definition_event_id": binding.definition_event_id().to_hex(),
+            "message_event_id": binding.message_event_id().to_hex(),
+            "cause": cause,
+        })
+    }
+
+    async fn delivery_route_fixture() -> Option<DeliveryRouteFixture> {
+        let mut config = crate::config::Config::from_env().ok()?;
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        config.database_url = database_url.clone();
+        config.redis_url = "redis://127.0.0.1:6379".to_owned();
+        let host = format!("workflow-delivery-{}.example", Uuid::new_v4().simple());
+        config.relay_url = format!("wss://{host}");
+        config.require_relay_membership = false;
+
+        let pool = PgPool::connect(&database_url).await.ok()?;
+        let db = buzz_db::Db::from_pool(pool.clone());
+        db.migrate().await.ok()?;
+        let community = db.ensure_configured_community(&host).await.ok()?.id;
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .ok()?;
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .ok()?,
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+        let (mut state, _audit_shutdown) = AppState::new(
+            config,
+            db.clone(),
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+
+        let owner = Keys::generate();
+        let target = Keys::generate();
+        let other_target = Keys::generate();
+        for keys in [&owner, &target, &other_target] {
+            db.ensure_user(community, keys.public_key().as_bytes())
+                .await
+                .ok()?;
+        }
+        db.set_agent_owner(
+            community,
+            target.public_key().as_bytes(),
+            owner.public_key().as_bytes(),
+        )
+        .await
+        .ok()?;
+        db.set_agent_owner(
+            community,
+            other_target.public_key().as_bytes(),
+            owner.public_key().as_bytes(),
+        )
+        .await
+        .ok()?;
+        let channel = db
+            .create_channel(
+                community,
+                "delivery-route-test",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                owner.public_key().as_bytes(),
+                Some(3600),
+            )
+            .await
+            .ok()?;
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel.id),
+                owner.public_key().as_bytes(),
+                "delivery-route-test",
+                r#"{"name":"delivery-route-test","on":{"manual":{}},"steps":[]}"#,
+                &[0x44; 32],
+            )
+            .await
+            .ok()?;
+        let definition = EventBuilder::new(Kind::Custom(30620), "signed definition")
+            .tag(Tag::parse(["d", workflow_id.to_string().as_str()]).ok()?)
+            .sign_with_keys(&owner)
+            .ok()?;
+        let message = EventBuilder::new(Kind::Custom(9), "private execution input")
+            .tags([
+                Tag::parse(["h", channel.id.to_string().as_str()]).ok()?,
+                Tag::parse([
+                    "p",
+                    target.public_key().to_hex().as_str(),
+                    "",
+                    buzz_core::workflow_delivery::WORKFLOW_DELIVERY_TARGET_MARKER,
+                ])
+                .ok()?,
+            ])
+            .sign_with_keys(&owner)
+            .ok()?;
+        db.insert_event(community, &definition, Some(channel.id))
+            .await
+            .ok()?;
+        db.insert_event(community, &message, Some(channel.id))
+            .await
+            .ok()?;
+        sqlx::query(
+            "UPDATE workflows SET definition_event_id = $3 WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(workflow_id)
+        .bind(definition.id.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .ok()?;
+        let run_id = db
+            .create_workflow_run(
+                community,
+                workflow_id,
+                definition.id.as_bytes(),
+                Some(message.id.as_bytes()),
+                None,
+            )
+            .await
+            .ok()?;
+        let binding = WorkflowDeliveryBinding::new(
+            community,
+            workflow_id,
+            run_id,
+            "notify",
+            target.public_key(),
+            definition.id,
+            message.id,
+            WorkflowDeliveryCause::Event(message.id),
+        )
+        .ok()?;
+        let delivery_id = WorkflowDeliveryId::from_uuid(Uuid::new_v4());
+        let (transaction, existing) = buzz_db::workflow::lock_workflow_agent_delivery_identity(
+            &pool, community, run_id, "notify",
+        )
+        .await
+        .ok()?;
+        if existing {
+            return None;
+        }
+        let stored_message = db
+            .get_event_by_id(community, message.id.as_bytes())
+            .await
+            .ok()??;
+        buzz_db::workflow::commit_workflow_agent_deliveries(
+            transaction,
+            community,
+            DateTime::<Utc>::from_timestamp(stored_message.event.created_at.as_secs() as i64, 0)
+                .expect("message timestamp"),
+            &[WorkflowAgentDelivery {
+                id: delivery_id,
+                binding: binding.clone(),
+            }],
+        )
+        .await
+        .ok()?;
+
+        Some(DeliveryRouteFixture {
+            state: Arc::new(state),
+            pool,
+            host,
+            community,
+            target,
+            other_target,
+            binding,
+            delivery_id,
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn authenticated_delivery_routes_complete_the_fenced_lifecycle() {
+        let Some(fixture) = delivery_route_fixture().await else {
+            eprintln!("skipping: Postgres unavailable");
+            return;
+        };
+        let binding = binding_json(&fixture.binding);
+        let claim = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            "/workflows/agent-deliveries/claim",
+            serde_json::json!({
+                "delivery_id": fixture.delivery_id.as_uuid(),
+                "expected": binding,
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(claim.status(), StatusCode::OK);
+        let claimed = response_json(claim).await;
+        assert_eq!(claimed["delivery"]["lease_generation"], 1);
+        assert_eq!(claimed["definition_event"]["content"], "signed definition");
+        assert_eq!(
+            claimed["message_event"]["content"],
+            "private execution input"
+        );
+        assert!(claimed.get("execution_trace").is_none());
+
+        let lease = serde_json::json!({
+            "lease_generation": 1,
+            "binding": binding_json(&fixture.binding),
+        });
+        let path = format!("/workflows/agent-deliveries/{}/read", fixture.delivery_id);
+        let read = post_delivery_json(&fixture, &fixture.target, &path, lease.clone()).await;
+        assert_eq!(read.status(), StatusCode::OK);
+
+        let path = format!("/workflows/agent-deliveries/{}/renew", fixture.delivery_id);
+        let renew = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            &path,
+            serde_json::json!({
+                "lease_generation": 1,
+                "binding": binding_json(&fixture.binding),
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(renew.status(), StatusCode::OK);
+        assert_eq!(response_json(renew).await["renewed"], true);
+
+        let path = format!("/workflows/agent-deliveries/{}/finish", fixture.delivery_id);
+        let finish_body = serde_json::json!({
+            "lease_generation": 1,
+            "binding": binding_json(&fixture.binding),
+            "disposition": "finished",
+        });
+        let finish =
+            post_delivery_json(&fixture, &fixture.target, &path, finish_body.clone()).await;
+        assert_eq!(finish.status(), StatusCode::OK);
+        assert_eq!(response_json(finish).await["replayed"], false);
+        let replay = post_delivery_json(&fixture, &fixture.target, &path, finish_body).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["replayed"], true);
+        let conflicting = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            &path,
+            serde_json::json!({
+                "lease_generation": 1,
+                "binding": binding_json(&fixture.binding),
+                "disposition": "failed",
+            }),
+        )
+        .await;
+        assert_eq!(conflicting.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn authenticated_delivery_routes_reject_wrong_authority_and_stale_fences() {
+        let Some(fixture) = delivery_route_fixture().await else {
+            eprintln!("skipping: Postgres unavailable");
+            return;
+        };
+        let claim_path = "/workflows/agent-deliveries/claim";
+        let wrong_target = post_delivery_json(
+            &fixture,
+            &fixture.other_target,
+            claim_path,
+            serde_json::json!({
+                "delivery_id": fixture.delivery_id.as_uuid(),
+                "expected": binding_json(&fixture.binding),
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(wrong_target.status(), StatusCode::NOT_FOUND);
+
+        let mut wrong_tenant = binding_json(&fixture.binding);
+        wrong_tenant["community_id"] = serde_json::json!(Uuid::new_v4());
+        let response = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            claim_path,
+            serde_json::json!({
+                "delivery_id": fixture.delivery_id.as_uuid(),
+                "expected": wrong_tenant,
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut wrong_binding = binding_json(&fixture.binding);
+        wrong_binding["step_id"] = serde_json::json!("other-step");
+        let response = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            claim_path,
+            serde_json::json!({
+                "delivery_id": fixture.delivery_id.as_uuid(),
+                "expected": wrong_binding,
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let claim = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            claim_path,
+            serde_json::json!({
+                "delivery_id": fixture.delivery_id.as_uuid(),
+                "expected": binding_json(&fixture.binding),
+                "lease_seconds": 60,
+            }),
+        )
+        .await;
+        assert_eq!(claim.status(), StatusCode::OK);
+        let read_path = format!("/workflows/agent-deliveries/{}/read", fixture.delivery_id);
+        let stale_generation = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            &read_path,
+            serde_json::json!({
+                "lease_generation": 0,
+                "binding": binding_json(&fixture.binding),
+            }),
+        )
+        .await;
+        assert_eq!(stale_generation.status(), StatusCode::CONFLICT);
+
+        sqlx::query(
+            "UPDATE workflow_agent_deliveries SET lease_until = NOW() - INTERVAL '1 second' WHERE community_id = $1 AND id = $2",
+        )
+        .bind(fixture.community.as_uuid())
+        .bind(fixture.delivery_id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .expect("expire delivery lease");
+        let expired = post_delivery_json(
+            &fixture,
+            &fixture.target,
+            &read_path,
+            serde_json::json!({
+                "lease_generation": 1,
+                "binding": binding_json(&fixture.binding),
+            }),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::CONFLICT);
+    }
 
     #[test]
     fn request_path_preserves_signed_query_verbatim() {
