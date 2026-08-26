@@ -3620,6 +3620,62 @@ impl Db {
         workflow::get_workflow_run(&self.pool, community_id, id).await
     }
 
+    /// Claim one pending workflow delivery for the authenticated target.
+    #[datastore_span(name = "claim_workflow_agent_delivery", system = "postgresql")]
+    pub async fn claim_workflow_agent_delivery(
+        &self,
+        community_id: CommunityId,
+        target_pubkey: &nostr::PublicKey,
+        delivery_id: Option<buzz_core::workflow_delivery::WorkflowDeliveryId>,
+        expected: Option<&buzz_core::workflow_delivery::WorkflowDeliveryBinding>,
+        lease_seconds: i64,
+    ) -> Result<
+        Option<(
+            workflow::WorkflowDeliveryLease,
+            workflow::WorkflowAgentDeliveryRecord,
+        )>,
+    > {
+        workflow::claim_workflow_agent_delivery(
+            &self.pool,
+            community_id,
+            target_pubkey,
+            delivery_id,
+            expected,
+            lease_seconds,
+        )
+        .await
+    }
+
+    /// Extend a live workflow delivery lease.
+    #[datastore_span(name = "renew_workflow_agent_delivery", system = "postgresql")]
+    pub async fn renew_workflow_agent_delivery(
+        &self,
+        lease: &workflow::WorkflowDeliveryLease,
+        lease_seconds: i64,
+    ) -> Result<workflow::WorkflowDeliveryRenewOutcome> {
+        workflow::renew_workflow_agent_delivery(&self.pool, lease, lease_seconds).await
+    }
+
+    /// Settle a workflow delivery under its current fenced lease.
+    #[datastore_span(name = "finish_workflow_agent_delivery", system = "postgresql")]
+    pub async fn finish_workflow_agent_delivery(
+        &self,
+        lease: &workflow::WorkflowDeliveryLease,
+        outcome: workflow::WorkflowDeliveryOutcome,
+    ) -> Result<workflow::WorkflowDeliveryFinishOutcome> {
+        workflow::finish_workflow_agent_delivery(&self.pool, lease, outcome).await
+    }
+
+    /// Fetch one workflow delivery within its server-resolved community.
+    #[datastore_span(name = "get_workflow_agent_delivery", system = "postgresql")]
+    pub async fn get_workflow_agent_delivery(
+        &self,
+        community_id: CommunityId,
+        delivery_id: buzz_core::workflow_delivery::WorkflowDeliveryId,
+    ) -> Result<Option<workflow::WorkflowAgentDeliveryRecord>> {
+        workflow::get_workflow_agent_delivery(&self.pool, community_id, delivery_id).await
+    }
+
     /// List runs for a workflow.
     #[datastore_span(name = "list_workflow_runs", system = "postgresql")]
     pub async fn list_workflow_runs(

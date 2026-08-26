@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Json,
@@ -15,7 +16,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use buzz_core::TenantContext;
+use buzz_core::{
+    workflow_delivery::{WorkflowDeliveryBinding, WorkflowDeliveryCause, WorkflowDeliveryId},
+    TenantContext,
+};
 
 use crate::{
     api::{api_error, bridge, internal_error},
@@ -247,6 +251,545 @@ pub async fn run_approvals(
     })))
 }
 
+const DEFAULT_DELIVERY_LEASE_SECONDS: i64 = 60;
+const MIN_DELIVERY_LEASE_SECONDS: i64 = 15;
+const MAX_DELIVERY_LEASE_SECONDS: i64 = 300;
+
+/// Full immutable selector for a specific durable delivery.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBindingRequest {
+    community_id: Uuid,
+    workflow_id: Uuid,
+    run_id: Uuid,
+    step_id: String,
+    target_pubkey: String,
+    definition_event_id: String,
+    message_event_id: String,
+    cause: DeliveryCauseRequest,
+}
+
+/// Trigger authority identity carried by a delivery binding.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeliveryCauseRequest {
+    /// Exact signed event which caused the run.
+    Event {
+        /// Trigger event identifier.
+        event_id: String,
+    },
+    /// Exact scheduled firing slot which caused the run.
+    Schedule {
+        /// Authoritative Unix-second schedule slot.
+        scheduled_for_unix_seconds: i64,
+    },
+    /// Opaque server-side webhook invocation identity.
+    Webhook {
+        /// Invocation identifier; no webhook secret or payload.
+        invocation_id: Uuid,
+    },
+}
+
+/// Request to claim a specific delivery or poll the oldest pending delivery.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimDeliveryRequest {
+    #[serde(default)]
+    delivery_id: Option<Uuid>,
+    #[serde(default)]
+    expected: Option<DeliveryBindingRequest>,
+    #[serde(default = "default_delivery_lease_seconds")]
+    lease_seconds: i64,
+}
+
+/// Fenced lease capability presented to read, renew, or finish a delivery.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryLeaseRequest {
+    lease_generation: i64,
+    binding: DeliveryBindingRequest,
+}
+
+/// Request to extend a delivery lease.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewDeliveryRequest {
+    lease_generation: i64,
+    binding: DeliveryBindingRequest,
+    #[serde(default = "default_delivery_lease_seconds")]
+    lease_seconds: i64,
+}
+
+/// Terminal disposition for a delivery.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDisposition {
+    /// Delivery work completed successfully.
+    Finished,
+    /// Delivery work failed permanently.
+    Failed,
+}
+
+/// Request to settle a delivery under its fenced lease.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishDeliveryRequest {
+    lease_generation: i64,
+    binding: DeliveryBindingRequest,
+    disposition: DeliveryDisposition,
+}
+
+fn default_delivery_lease_seconds() -> i64 {
+    DEFAULT_DELIVERY_LEASE_SECONDS
+}
+
+fn validate_lease_seconds(value: i64) -> Result<i64, (StatusCode, Json<Value>)> {
+    if !(MIN_DELIVERY_LEASE_SECONDS..=MAX_DELIVERY_LEASE_SECONDS).contains(&value) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "lease_seconds must be between 15 and 300",
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_event_id(value: &str, field: &str) -> Result<nostr::EventId, (StatusCode, Json<Value>)> {
+    nostr::EventId::from_hex(value)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, &format!("invalid {field}")))
+}
+
+fn parse_delivery_binding(
+    request: DeliveryBindingRequest,
+    tenant: &TenantContext,
+    authenticated: nostr::PublicKey,
+) -> Result<WorkflowDeliveryBinding, (StatusCode, Json<Value>)> {
+    if request.community_id != *tenant.community().as_uuid() {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+    let target = nostr::PublicKey::from_hex(&request.target_pubkey)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid target_pubkey"))?;
+    if target != authenticated {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+    let cause = match request.cause {
+        DeliveryCauseRequest::Event { event_id } => {
+            WorkflowDeliveryCause::Event(parse_event_id(&event_id, "cause.event_id")?)
+        }
+        DeliveryCauseRequest::Schedule {
+            scheduled_for_unix_seconds,
+        } => WorkflowDeliveryCause::Schedule {
+            scheduled_for_unix_seconds,
+        },
+        DeliveryCauseRequest::Webhook { invocation_id } => {
+            WorkflowDeliveryCause::Webhook { invocation_id }
+        }
+    };
+    WorkflowDeliveryBinding::new(
+        tenant.community(),
+        request.workflow_id,
+        request.run_id,
+        request.step_id,
+        target,
+        parse_event_id(&request.definition_event_id, "definition_event_id")?,
+        parse_event_id(&request.message_event_id, "message_event_id")?,
+        cause,
+    )
+    .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid delivery binding"))
+}
+
+async fn authorize_delivery_request(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    path: &str,
+    body: &[u8],
+) -> Result<(TenantContext, nostr::PublicKey), (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "delivery not found"))?;
+    let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
+    let (pubkey, event_id) = bridge::verify_bridge_auth_with_options(
+        headers,
+        "POST",
+        &url,
+        Some(body),
+        state.config.require_auth_token,
+        true,
+    )?;
+    bridge::enforce_http_admission(state, &tenant, &pubkey).await?;
+    bridge::check_nip98_replay(state, &tenant, event_id).await?;
+    let pubkey_bytes = pubkey.to_bytes();
+    let auth_tag = headers
+        .get("x-auth-tag")
+        .and_then(|value| value.to_str().ok());
+    super::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        auth_tag,
+    )
+    .await?;
+    let (_, owner) = state
+        .db
+        .get_agent_channel_policy(tenant.community(), &pubkey_bytes)
+        .await
+        .map_err(|error| internal_error(&format!("delivery target lookup: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "delivery not found"))?;
+    if owner.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+    Ok((tenant, pubkey))
+}
+
+async fn validate_binding_channel(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    binding: &WorkflowDeliveryBinding,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let message = state
+        .db
+        .get_event_by_id(tenant.community(), binding.message_event_id().as_bytes())
+        .await
+        .map_err(|error| internal_error(&format!("delivery message lookup: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "delivery not found"))?;
+    let Some(channel_id) = message.channel_id else {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    };
+    let workflow = state
+        .db
+        .get_workflow(tenant.community(), binding.workflow_id())
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "delivery not found"))?;
+    if workflow.channel_id != Some(channel_id) {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+    Ok(())
+}
+
+async fn current_bound_delivery(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    target: nostr::PublicKey,
+    delivery_id: WorkflowDeliveryId,
+    lease_generation: i64,
+    requested: DeliveryBindingRequest,
+    require_live_claim: bool,
+) -> Result<buzz_db::workflow::WorkflowAgentDeliveryRecord, (StatusCode, Json<Value>)> {
+    let delivery = state
+        .db
+        .get_workflow_agent_delivery(tenant.community(), delivery_id)
+        .await
+        .map_err(|error| internal_error(&format!("read workflow delivery: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "delivery not found"))?;
+    let binding = parse_delivery_binding(requested, tenant, target)?;
+    let live_claim = delivery.status == buzz_db::workflow::WorkflowDeliveryStatus::Claimed
+        && delivery
+            .lease_until
+            .is_some_and(|until| until >= Utc::now());
+    if delivery.binding != binding
+        || delivery.lease_generation != lease_generation
+        || (require_live_claim && !live_claim)
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "delivery lease is not current",
+        ));
+    }
+    // Resolve message/channel authority only after the caller has demonstrated
+    // the complete delivery binding. Otherwise this endpoint becomes an event
+    // existence oracle for arbitrary managed-agent identities.
+    validate_binding_channel(state, tenant, &binding).await?;
+    Ok(delivery)
+}
+
+fn lease_for(
+    tenant: &TenantContext,
+    target: nostr::PublicKey,
+    delivery_id: WorkflowDeliveryId,
+    lease_generation: i64,
+) -> buzz_db::workflow::WorkflowDeliveryLease {
+    buzz_db::workflow::WorkflowDeliveryLease {
+        community_id: tenant.community(),
+        delivery_id,
+        target_pubkey: target,
+        lease_generation,
+        // C's mutation queries fence on community/id/target/generation and the
+        // database clock. This field is returned state, not client authority.
+        lease_until: Utc::now(),
+    }
+}
+
+/// `POST /workflows/agent-deliveries/claim` — claim only as the immutable
+/// managed-agent target. A wake can supply identifiers but grants no authority.
+pub async fn claim_agent_delivery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = "/workflows/agent-deliveries/claim";
+    let (tenant, target) = authorize_delivery_request(&state, &headers, path, &body).await?;
+    let request: ClaimDeliveryRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid delivery claim JSON"))?;
+    let lease_seconds = validate_lease_seconds(request.lease_seconds)?;
+    if request.delivery_id.is_none() && request.expected.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "expected binding requires delivery_id",
+        ));
+    }
+    let delivery_id = request.delivery_id.map(WorkflowDeliveryId::from_uuid);
+    let expected = request
+        .expected
+        .map(|expected| parse_delivery_binding(expected, &tenant, target))
+        .transpose()?;
+    if let Some(binding) = expected.as_ref() {
+        validate_binding_channel(&state, &tenant, binding).await?;
+    }
+    let claimed = state
+        .db
+        .claim_workflow_agent_delivery(
+            tenant.community(),
+            &target,
+            delivery_id,
+            expected.as_ref(),
+            lease_seconds,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("claim workflow delivery: {error}")))?;
+    let Some((lease, delivery)) = claimed else {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    };
+    delivery_response(&state, &tenant, &target, &lease, &delivery).await
+}
+
+/// `POST /workflows/agent-deliveries/{id}/read` — return private execution
+/// inputs only to the exact target holding the current live fencing token.
+pub async fn read_agent_delivery(
+    State(state): State<Arc<AppState>>,
+    Path(delivery_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = format!("/workflows/agent-deliveries/{delivery_id}/read");
+    let (tenant, target) = authorize_delivery_request(&state, &headers, &path, &body).await?;
+    let request: DeliveryLeaseRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid delivery read JSON"))?;
+    let id = WorkflowDeliveryId::from_uuid(delivery_id);
+    let delivery = current_bound_delivery(
+        &state,
+        &tenant,
+        target,
+        id,
+        request.lease_generation,
+        request.binding,
+        true,
+    )
+    .await?;
+    let lease = lease_for(&tenant, target, id, request.lease_generation);
+    delivery_response(&state, &tenant, &target, &lease, &delivery).await
+}
+
+/// `POST /workflows/agent-deliveries/{id}/renew` — extend the current fenced lease.
+pub async fn renew_agent_delivery(
+    State(state): State<Arc<AppState>>,
+    Path(delivery_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = format!("/workflows/agent-deliveries/{delivery_id}/renew");
+    let (tenant, target) = authorize_delivery_request(&state, &headers, &path, &body).await?;
+    let request: RenewDeliveryRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid delivery renewal JSON"))?;
+    let lease_seconds = validate_lease_seconds(request.lease_seconds)?;
+    let id = WorkflowDeliveryId::from_uuid(delivery_id);
+    current_bound_delivery(
+        &state,
+        &tenant,
+        target,
+        id,
+        request.lease_generation,
+        request.binding,
+        true,
+    )
+    .await?;
+    let lease = lease_for(&tenant, target, id, request.lease_generation);
+    match state
+        .db
+        .renew_workflow_agent_delivery(&lease, lease_seconds)
+        .await
+        .map_err(|error| internal_error(&format!("renew workflow delivery: {error}")))?
+    {
+        buzz_db::workflow::WorkflowDeliveryRenewOutcome::Renewed(lease_until) => Ok(Json(
+            serde_json::json!({"renewed": true, "lease_until": lease_until}),
+        )),
+        buzz_db::workflow::WorkflowDeliveryRenewOutcome::LeaseLost => Err(api_error(
+            StatusCode::CONFLICT,
+            "delivery lease is not current",
+        )),
+    }
+}
+
+/// `POST /workflows/agent-deliveries/{id}/finish` — settle once, with stable
+/// acknowledgement only when a terminal replay has the identical disposition.
+pub async fn finish_agent_delivery(
+    State(state): State<Arc<AppState>>,
+    Path(delivery_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = format!("/workflows/agent-deliveries/{delivery_id}/finish");
+    let (tenant, target) = authorize_delivery_request(&state, &headers, &path, &body).await?;
+    let request: FinishDeliveryRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid delivery finish JSON"))?;
+    let id = WorkflowDeliveryId::from_uuid(delivery_id);
+    current_bound_delivery(
+        &state,
+        &tenant,
+        target,
+        id,
+        request.lease_generation,
+        request.binding,
+        false,
+    )
+    .await?;
+    let requested = match request.disposition {
+        DeliveryDisposition::Finished => buzz_db::workflow::WorkflowDeliveryOutcome::Finished,
+        DeliveryDisposition::Failed => buzz_db::workflow::WorkflowDeliveryOutcome::Failed,
+    };
+    let lease = lease_for(&tenant, target, id, request.lease_generation);
+    match state
+        .db
+        .finish_workflow_agent_delivery(&lease, requested)
+        .await
+        .map_err(|error| internal_error(&format!("finish workflow delivery: {error}")))?
+    {
+        buzz_db::workflow::WorkflowDeliveryFinishOutcome::Settled(_) => Ok(Json(
+            serde_json::json!({"finished": true, "replayed": false}),
+        )),
+        buzz_db::workflow::WorkflowDeliveryFinishOutcome::AlreadyTerminal(status)
+            if terminal_matches(status, request.disposition) =>
+        {
+            Ok(Json(
+                serde_json::json!({"finished": true, "replayed": true}),
+            ))
+        }
+        buzz_db::workflow::WorkflowDeliveryFinishOutcome::AlreadyTerminal(_)
+        | buzz_db::workflow::WorkflowDeliveryFinishOutcome::LeaseLost => Err(api_error(
+            StatusCode::CONFLICT,
+            "delivery lease is not current",
+        )),
+    }
+}
+
+fn terminal_matches(
+    status: buzz_db::workflow::WorkflowDeliveryStatus,
+    disposition: DeliveryDisposition,
+) -> bool {
+    matches!(
+        (status, disposition),
+        (
+            buzz_db::workflow::WorkflowDeliveryStatus::Finished,
+            DeliveryDisposition::Finished
+        ) | (
+            buzz_db::workflow::WorkflowDeliveryStatus::Failed,
+            DeliveryDisposition::Failed
+        )
+    )
+}
+
+async fn delivery_response(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    target: &nostr::PublicKey,
+    lease: &buzz_db::workflow::WorkflowDeliveryLease,
+    delivery: &buzz_db::workflow::WorkflowAgentDeliveryRecord,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if delivery.binding.community_id() != tenant.community()
+        || delivery.binding.target_pubkey() != *target
+        || delivery.id != lease.delivery_id
+        || delivery.lease_generation != lease.lease_generation
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "delivery not found"));
+    }
+    let run = state
+        .db
+        .get_workflow_run(tenant.community(), delivery.binding.run_id())
+        .await
+        .map_err(|error| internal_error(&format!("delivery run lookup: {error}")))?;
+    if run.workflow_id != delivery.binding.workflow_id()
+        || run.definition_event_id.as_deref()
+            != Some(delivery.binding.definition_event_id().as_bytes())
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "delivery binding is unavailable",
+        ));
+    }
+    let definition = state
+        .db
+        .get_event_by_id(
+            tenant.community(),
+            delivery.binding.definition_event_id().as_bytes(),
+        )
+        .await
+        .map_err(|error| internal_error(&format!("delivery definition lookup: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "delivery binding is unavailable"))?;
+    let message = state
+        .db
+        .get_event_by_id(
+            tenant.community(),
+            delivery.binding.message_event_id().as_bytes(),
+        )
+        .await
+        .map_err(|error| internal_error(&format!("delivery message lookup: {error}")))?
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "delivery binding is unavailable"))?;
+    Ok(Json(serde_json::json!({
+        "delivery": delivery_json(delivery, lease),
+        "definition_event": definition.event,
+        "message_event": message.event,
+    })))
+}
+
+fn delivery_json(
+    delivery: &buzz_db::workflow::WorkflowAgentDeliveryRecord,
+    lease: &buzz_db::workflow::WorkflowDeliveryLease,
+) -> Value {
+    let binding = &delivery.binding;
+    serde_json::json!({
+        "id": delivery.id.as_uuid(),
+        "community_id": binding.community_id().as_uuid(),
+        "workflow_id": binding.workflow_id(),
+        "run_id": binding.run_id(),
+        "step_id": binding.step_id(),
+        "target_pubkey": binding.target_pubkey().to_hex(),
+        "definition_event_id": binding.definition_event_id().to_hex(),
+        "message_event_id": binding.message_event_id().to_hex(),
+        "cause": delivery_cause_json(binding.cause()),
+        "lease_generation": lease.lease_generation,
+        "lease_until": lease.lease_until,
+    })
+}
+
+fn delivery_cause_json(cause: &WorkflowDeliveryCause) -> Value {
+    match cause {
+        WorkflowDeliveryCause::Event(event_id) => {
+            serde_json::json!({"kind": "event", "event_id": event_id.to_hex()})
+        }
+        WorkflowDeliveryCause::Schedule {
+            scheduled_for_unix_seconds,
+        } => serde_json::json!({
+            "kind": "schedule",
+            "scheduled_for_unix_seconds": scheduled_for_unix_seconds,
+        }),
+        WorkflowDeliveryCause::Webhook { invocation_id } => {
+            serde_json::json!({"kind": "webhook", "invocation_id": invocation_id})
+        }
+    }
+}
+
 fn run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
     serde_json::json!({
         "id": run.id,
@@ -292,6 +835,132 @@ mod tests {
             request_path("/workflows/id/runs", None),
             "/workflows/id/runs"
         );
+    }
+
+    #[test]
+    fn delivery_wire_excludes_private_run_state() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+        let target = nostr::Keys::generate().public_key();
+        let binding = WorkflowDeliveryBinding::new(
+            community,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "notify".to_owned(),
+            target,
+            nostr::EventId::from_byte_array([0x11; 32]),
+            nostr::EventId::from_byte_array([0x22; 32]),
+            WorkflowDeliveryCause::Webhook {
+                invocation_id: Uuid::new_v4(),
+            },
+        )
+        .expect("valid delivery binding");
+        let delivery = buzz_db::workflow::WorkflowAgentDeliveryRecord {
+            id: WorkflowDeliveryId::from_uuid(Uuid::new_v4()),
+            binding,
+            status: buzz_db::workflow::WorkflowDeliveryStatus::Claimed,
+            lease_generation: 4,
+            lease_until: Some(Utc::now()),
+            claimed_at: Some(Utc::now()),
+            finished_at: None,
+            created_at: Utc::now(),
+        };
+        let lease = buzz_db::workflow::WorkflowDeliveryLease {
+            community_id: community,
+            delivery_id: delivery.id,
+            target_pubkey: target,
+            lease_generation: 4,
+            lease_until: Utc::now(),
+        };
+
+        let wire = serde_json::json!({
+            "delivery": delivery_json(&delivery, &lease),
+            "definition_event": {"content": "signed definition"},
+            "message_event": {"content": "visible message"},
+        });
+        assert!(wire.get("execution_trace").is_none());
+        assert!(wire.get("trigger_context").is_none());
+        assert!(wire.get("webhook_fields").is_none());
+        assert_eq!(wire["delivery"]["lease_generation"], 4);
+    }
+
+    #[test]
+    fn delivery_binding_rejects_cross_tenant_and_cross_target() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+        let tenant = TenantContext::resolved(community, "agent.example");
+        let authenticated = nostr::Keys::generate().public_key();
+        let other = nostr::Keys::generate().public_key();
+        let request = |community_id, target_pubkey: String| DeliveryBindingRequest {
+            community_id,
+            workflow_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            step_id: "notify".to_owned(),
+            target_pubkey,
+            definition_event_id: "11".repeat(32),
+            message_event_id: "22".repeat(32),
+            cause: DeliveryCauseRequest::Webhook {
+                invocation_id: Uuid::new_v4(),
+            },
+        };
+
+        let (status, _) = parse_delivery_binding(
+            request(Uuid::new_v4(), authenticated.to_hex()),
+            &tenant,
+            authenticated,
+        )
+        .expect_err("body tenant cannot override host-resolved tenant");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = parse_delivery_binding(
+            request(*community.as_uuid(), other.to_hex()),
+            &tenant,
+            authenticated,
+        )
+        .expect_err("authenticated target must match the binding");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn malformed_binding_and_lease_bounds_fail_closed() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+        let tenant = TenantContext::resolved(community, "agent.example");
+        let authenticated = nostr::Keys::generate().public_key();
+        let malformed = DeliveryBindingRequest {
+            community_id: *community.as_uuid(),
+            workflow_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            step_id: "notify".to_owned(),
+            target_pubkey: authenticated.to_hex(),
+            definition_event_id: "not-an-event-id".to_owned(),
+            message_event_id: "22".repeat(32),
+            cause: DeliveryCauseRequest::Webhook {
+                invocation_id: Uuid::new_v4(),
+            },
+        };
+        let (status, _) = parse_delivery_binding(malformed, &tenant, authenticated)
+            .expect_err("malformed signed authority must fail closed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(validate_lease_seconds(MIN_DELIVERY_LEASE_SECONDS - 1).is_err());
+        assert!(validate_lease_seconds(MAX_DELIVERY_LEASE_SECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn terminal_replay_requires_the_same_disposition() {
+        assert!(terminal_matches(
+            buzz_db::workflow::WorkflowDeliveryStatus::Finished,
+            DeliveryDisposition::Finished,
+        ));
+        assert!(terminal_matches(
+            buzz_db::workflow::WorkflowDeliveryStatus::Failed,
+            DeliveryDisposition::Failed,
+        ));
+        assert!(!terminal_matches(
+            buzz_db::workflow::WorkflowDeliveryStatus::Finished,
+            DeliveryDisposition::Failed,
+        ));
+        assert!(!terminal_matches(
+            buzz_db::workflow::WorkflowDeliveryStatus::Failed,
+            DeliveryDisposition::Finished,
+        ));
     }
 
     #[test]
