@@ -58,11 +58,5 @@ jobs:
             git merge --abort
             gh issue create \
               --title "Sync conflict with upstream $(date +%Y-%m-%d)" \
-              --body "Merging \`main\` into \`lab\` conflicts in:
-
-\`\`\`
-$FILES
-\`\`\`
-
-Resolve locally: \`git checkout -b $BRANCH lab && git merge main\`, fix, push, PR to \`lab\`."
+              --body "$(printf 'Merging `main` into `lab` conflicts in:\n\n```\n%s\n```\n\nResolve locally: `git checkout -b %s lab && git merge main`, fix, push, PR to `lab`.' "$FILES" "$BRANCH")"
           fi
