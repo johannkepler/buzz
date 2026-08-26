@@ -3437,6 +3437,23 @@ impl Db {
         workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
     }
 
+    /// Read the run linked by one durable scheduled-fire claim.
+    #[datastore_span(name = "get_scheduled_workflow_fire_run", system = "postgresql")]
+    pub async fn get_scheduled_workflow_fire_run(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        scheduled_for: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Uuid>> {
+        workflow::get_scheduled_workflow_fire_run(
+            &self.pool,
+            community_id,
+            workflow_id,
+            scheduled_for,
+        )
+        .await
+    }
+
     /// Attach the workflow run id created from a won scheduled-fire claim.
     #[datastore_span(name = "attach_scheduled_workflow_run", system = "postgresql")]
     pub async fn attach_scheduled_workflow_run(
@@ -3452,6 +3469,56 @@ impl Db {
             workflow_id,
             scheduled_for,
             workflow_run_id,
+        )
+        .await
+    }
+
+    /// Persist a payload-free webhook invocation authority.
+    pub async fn create_workflow_webhook_invocation(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        invocation_id: Uuid,
+    ) -> Result<()> {
+        workflow::create_workflow_webhook_invocation(
+            &self.pool,
+            community_id,
+            workflow_id,
+            invocation_id,
+        )
+        .await
+    }
+
+    /// Link a webhook invocation authority to the run it caused.
+    pub async fn attach_workflow_webhook_invocation_run(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        invocation_id: Uuid,
+        workflow_run_id: Uuid,
+    ) -> Result<bool> {
+        workflow::attach_workflow_webhook_invocation_run(
+            &self.pool,
+            community_id,
+            workflow_id,
+            invocation_id,
+            workflow_run_id,
+        )
+        .await
+    }
+
+    /// Read the run linked by one opaque webhook invocation.
+    pub async fn get_workflow_webhook_invocation_run(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        invocation_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        workflow::get_workflow_webhook_invocation_run(
+            &self.pool,
+            community_id,
+            workflow_id,
+            invocation_id,
         )
         .await
     }

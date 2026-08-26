@@ -17,7 +17,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use buzz_core::{
-    workflow_delivery::{WorkflowDeliveryBinding, WorkflowDeliveryCause, WorkflowDeliveryId},
+    workflow_delivery::{
+        WorkflowDeliveryBinding, WorkflowDeliveryCause, WorkflowDeliveryId, WorkflowDeliveryReceipt,
+    },
     TenantContext,
 };
 
@@ -700,6 +702,66 @@ fn terminal_matches(
     )
 }
 
+async fn validate_delivery_cause_authority(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    binding: &WorkflowDeliveryBinding,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let authoritative_run = match binding.cause() {
+        WorkflowDeliveryCause::Event(event_id) => {
+            let event = state
+                .db
+                .get_event_by_id(tenant.community(), event_id.as_bytes())
+                .await
+                .map_err(|error| internal_error(&format!("delivery cause lookup: {error}")))?
+                .ok_or_else(|| {
+                    api_error(StatusCode::CONFLICT, "delivery authority is unavailable")
+                })?;
+            if event.event.verify().is_err() {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "delivery authority is unavailable",
+                ));
+            }
+            return Ok(());
+        }
+        WorkflowDeliveryCause::Schedule {
+            scheduled_for_unix_seconds,
+        } => {
+            let scheduled_for =
+                chrono::DateTime::<Utc>::from_timestamp(*scheduled_for_unix_seconds, 0)
+                    .ok_or_else(|| {
+                        api_error(StatusCode::CONFLICT, "delivery authority is unavailable")
+                    })?;
+            state
+                .db
+                .get_scheduled_workflow_fire_run(
+                    tenant.community(),
+                    binding.workflow_id(),
+                    scheduled_for,
+                )
+                .await
+                .map_err(|error| internal_error(&format!("schedule authority lookup: {error}")))?
+        }
+        WorkflowDeliveryCause::Webhook { invocation_id } => state
+            .db
+            .get_workflow_webhook_invocation_run(
+                tenant.community(),
+                binding.workflow_id(),
+                *invocation_id,
+            )
+            .await
+            .map_err(|error| internal_error(&format!("webhook authority lookup: {error}")))?,
+    };
+    if authoritative_run != Some(binding.run_id()) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "delivery authority is unavailable",
+        ));
+    }
+    Ok(())
+}
+
 async fn delivery_response(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -746,10 +808,16 @@ async fn delivery_response(
         .await
         .map_err(|error| internal_error(&format!("delivery message lookup: {error}")))?
         .ok_or_else(|| api_error(StatusCode::CONFLICT, "delivery binding is unavailable"))?;
+    validate_delivery_cause_authority(state, tenant, &delivery.binding).await?;
+    let receipt =
+        WorkflowDeliveryReceipt::new(delivery.id, delivery.binding.clone(), &message.event)
+            .and_then(|receipt| receipt.sign(&state.relay_keypair, &message.event))
+            .map_err(|error| internal_error(&format!("sign delivery receipt: {error}")))?;
     Ok(Json(serde_json::json!({
         "delivery": delivery_json(delivery, lease),
         "definition_event": definition.event,
         "message_event": message.event,
+        "receipt_event": receipt,
     })))
 }
 
@@ -1154,6 +1222,16 @@ mod tests {
             "private execution input"
         );
         assert!(claimed.get("execution_trace").is_none());
+        assert!(claimed.get("trigger_context").is_none());
+        assert!(claimed.get("webhook_fields").is_none());
+        let receipt: nostr::Event =
+            serde_json::from_value(claimed["receipt_event"].clone()).expect("signed receipt event");
+        assert_eq!(receipt.pubkey, fixture.state.relay_keypair.public_key());
+        assert!(receipt.verify().is_ok());
+        assert!(receipt.content.is_empty());
+        assert!(!claimed["receipt_event"]
+            .to_string()
+            .contains("private execution input"));
 
         let lease = serde_json::json!({
             "lease_generation": 1,
