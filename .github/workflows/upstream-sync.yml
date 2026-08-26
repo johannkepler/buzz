@@ -1,0 +1,68 @@
+# Upstream sync: keep `main` a pristine mirror of block/buzz, and propose
+# its changes to `lab` (our divergence branch) as a reviewable PR.
+#
+#   main = upstream mirror; never commit here → sync is always --ff-only
+#   lab  = main + our commits; all divergence lives here
+#
+# Clean merge  → PR opened (merge it when CI is green).
+# Conflicts    → issue opened listing the files; resolve locally on a
+#                sync/ branch, push, PR manually. `git rerere` remembers.
+name: upstream-sync
+
+on:
+  workflow_dispatch: {}        # manual button — also the escape hatch, since
+  schedule:                    # GitHub pauses cron after 60d of repo inactivity
+    - cron: "0 6 * * 1"        # Mondays 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history — merges need it
+
+      - name: Fast-forward main from upstream
+        run: |
+          git config user.name  "upstream-sync"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/block/buzz.git
+          git fetch upstream main
+          git checkout main
+          git merge --ff-only upstream/main   # fails loudly if main was dirtied
+          git push origin main
+
+      - name: Propose merge into lab
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git checkout lab
+          if git merge-base --is-ancestor main lab; then
+            echo "lab already contains upstream main — nothing to do"
+            exit 0
+          fi
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+          if git merge --no-edit main; then
+            git push origin "$BRANCH"
+            gh pr create --base lab --head "$BRANCH" \
+              --title "Sync: upstream $(date +%Y-%m-%d)" \
+              --body "Automated merge of upstream (via \`main\`) into \`lab\`. Clean merge — review the diff, check CI, merge."
+          else
+            FILES=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            gh issue create \
+              --title "Sync conflict with upstream $(date +%Y-%m-%d)" \
+              --body "Merging \`main\` into \`lab\` conflicts in:
+
+\`\`\`
+$FILES
+\`\`\`
+
+Resolve locally: \`git checkout -b $BRANCH lab && git merge main\`, fix, push, PR to \`lab\`."
+          fi
