@@ -129,11 +129,14 @@ pub(crate) struct SpawnConfigSnapshot {
     /// The startup effort the harness will actually apply, resolved by
     /// [`effective_effort`]: the single effort key the harness-agnostic
     /// projection left in `descriptor.env` under the runtime's destination key.
-    /// This is the *sole* representation of effort in the snapshot — every
-    /// effort key is stripped from `env` (see `from_inputs`) so an authority
-    /// handoff that leaves the effective value unchanged produces no spurious
-    /// drift entry, and an effort edit surfaces as exactly one `effort_level`
-    /// entry.
+    /// This is the *sole* representation of the effective effort in the
+    /// snapshot: the projection's destination key is stripped from `env` (see
+    /// `from_inputs`) so an authority handoff that leaves the effective value
+    /// unchanged produces no spurious drift entry, and an effort edit the
+    /// projection consumed surfaces as exactly one `effort_level` entry. For an
+    /// unknown/custom runtime the projection consumes nothing beyond the
+    /// sentinel, so any other effort-looking key the child receives stays in
+    /// `env` as ordinary state and diffs normally.
     pub effort_level: Option<String>,
 }
 
@@ -177,16 +180,27 @@ impl SpawnConfigSnapshot {
                 .unwrap_or("")
                 .to_string(),
             // Effort has ONE representation in the snapshot: `effort_level`
-            // below, always holding the projected effective value. Every effort
-            // key is stripped from `env` (the full suppress set) so an authority
-            // handoff at the same value is a no-op (no phantom `env.*EFFORT*` add
-            // or remove) and an env-only effort edit surfaces as exactly one
-            // `effort_level` entry rather than a duplicate under `env.`.
+            // below, always holding the projected effective value. The keys
+            // stripped here mirror EXACTLY what the launch projection suppressed
+            // for this runtime (`snapshot_suppress_keys`): a known runtime swept
+            // every effort key to its single destination key, so the full set is
+            // stripped (a no-op beyond that dest key); an unknown/custom runtime
+            // used an empty suppress set (external-review-#2 pass-through), so
+            // only the ACP-startup sentinel is stripped and every other
+            // effort-looking key the child actually receives (e.g. a hand-rolled
+            // `GOOSE_THINKING_EFFORT`) stays as ordinary env — an edit to it must
+            // diff the snapshot and fire the restart badge. Stripping is
+            // ASCII-case-insensitive to match the projection's `apply`.
             env: {
                 let mut env = descriptor.env.clone();
-                for key in super::config_bridge::effort::effort_suppress_keys() {
-                    env.remove(key);
-                }
+                let suppress = super::config_bridge::effort::snapshot_suppress_keys(
+                    known_acp_runtime(&descriptor.command),
+                );
+                env.retain(|k, _| {
+                    !suppress
+                        .iter()
+                        .any(|suppressed| k.eq_ignore_ascii_case(suppressed))
+                });
                 env
             },
             relay_url: relay_url.to_string(),

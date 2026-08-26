@@ -226,3 +226,68 @@ fn canonical_effort_edit_changes_snapshot() {
         "a canonical effort edit must trip the restart badge"
     );
 }
+
+/// A custom-command record whose runtime matches no known ACP runtime, so the
+/// launch projection uses an EMPTY suppress set (external-review-#2
+/// pass-through) and the child actually receives its raw effort env.
+fn custom_command_record() -> ManagedAgentRecord {
+    let mut rec = record();
+    rec.agent_command_override = Some("/opt/custom/my-agent".into());
+    rec
+}
+
+#[test]
+fn custom_runtime_effort_env_stays_in_snapshot_and_diffs() {
+    // Regression (external review, Carl): for an unknown/custom runtime the
+    // launch projection strips NO effort key, so the child receives the raw
+    // `GOOSE_THINKING_EFFORT` from the wrapper's env. The snapshot must retain
+    // that key as ordinary env — the projection consumed nothing into
+    // `effort_level` (its dest key, the ACP sentinel, is absent) — so an edit to
+    // it diffs the snapshot and fires the restart badge. The prior full strip
+    // erased the key from both places, producing NO restart diff on an effort
+    // edit and leaving the running agent on stale effort.
+    let mut high = custom_command_record();
+    high.env_vars
+        .insert("GOOSE_THINKING_EFFORT".into(), "high".into());
+    let canonical = snap(&high);
+    assert_eq!(
+        canonical
+            .get("env")
+            .and_then(|env| env.get("GOOSE_THINKING_EFFORT"))
+            .and_then(|v| v.as_str()),
+        Some("high"),
+        "a custom runtime's effort env must remain in the snapshot as ordinary env"
+    );
+    assert_eq!(
+        canonical.get("effort_level").and_then(|v| v.as_str()),
+        None,
+        "the custom sentinel dest key is absent, so effort_level captures nothing"
+    );
+
+    let mut low = custom_command_record();
+    low.env_vars
+        .insert("GOOSE_THINKING_EFFORT".into(), "low".into());
+    assert_ne!(
+        snap(&low),
+        canonical,
+        "editing a custom runtime's effort env must trip the restart badge"
+    );
+}
+
+#[test]
+fn known_runtime_still_strips_native_effort_env_from_snapshot() {
+    // The counter-case pinning the scoping: for a KNOWN runtime the full sweep
+    // still applies, so `GOOSE_THINKING_EFFORT` reaches the snapshot only as the
+    // single `effort_level` field — never as a phantom `env` entry alongside it.
+    let canonical = snap(&record_with_env_effort("high"));
+    assert_eq!(
+        effort_env_leaf(&canonical),
+        None,
+        "a known runtime must still strip its native effort key from the snapshot env"
+    );
+    assert_eq!(
+        canonical.get("effort_level").and_then(|v| v.as_str()),
+        Some("high"),
+        "the known runtime's effort must land solely in the effort_level field"
+    );
+}

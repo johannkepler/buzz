@@ -205,6 +205,27 @@ pub(crate) fn effort_suppress_keys() -> Vec<&'static str> {
     keys
 }
 
+/// The effort keys the restart snapshot must strip from its captured launch env
+/// so effort keeps exactly ONE representation (`effort_level`), mirroring what
+/// [`effort_launch_projection`] actually suppressed for `runtime`:
+///
+/// - **known runtime** — the full suppress set. The projection already swept
+///   every effort key to the single destination key, so this removes only that
+///   destination key (a no-op on the already-swept siblings).
+/// - **unknown/custom runtime** — only the ACP-startup sentinel. The projection
+///   used an EMPTY suppress set here (external-review-#2 pass-through), leaving
+///   every other effort-looking key (e.g. a hand-rolled `GOOSE_THINKING_EFFORT`)
+///   untouched as ordinary env. Those must remain in `env` so an edit to them
+///   diffs the snapshot normally; only the sentinel — the key the projection
+///   emits and `effective_effort` reads into `effort_level` — is removed.
+pub(crate) fn snapshot_suppress_keys(runtime: Option<&KnownAcpRuntime>) -> Vec<&'static str> {
+    if runtime.is_some() {
+        effort_suppress_keys()
+    } else {
+        vec![effort_dest_key(runtime)]
+    }
+}
+
 /// Build the single effective-effort projection for a launch.
 ///
 /// `global_env`, `persona_id`+`personas`, `harness_def`, and `baked_env` supply
